@@ -27,6 +27,7 @@ from mcap_converter.core.quality import (
     QualityThresholds,
     TopicQualityReport,
     _TopicSummary,
+    _collect_timestamps,
     analyze_topic_coverage,
     apply_batch_fps_check,
     apply_batch_topic_presence_check,
@@ -553,6 +554,14 @@ class TestApplyBatchTopicPresenceCheck:
 
 
 class TestScanEpisodeIntegration:
+    def test_collect_timestamps_preserves_monitored_message_count_and_span(self):
+        ts_map = _collect_timestamps(str(_STUB_MCAP), ["/joint_states"])
+
+        assert len(ts_map["/joint_states"]) == 120
+        assert ts_map["/joint_states"][-1] - ts_map["/joint_states"][0] == pytest.approx(
+            3.966666627, abs=1e-6
+        )
+
     def test_healthy_stub_passes(self):
         report = scan_episode(str(_STUB_MCAP), QualityThresholds())
 
@@ -626,12 +635,10 @@ class TestScanEpisodeIntegration:
         assert rosout.avg_fps is None
         assert report.severity == baseline.severity
 
-    def test_unclassified_topic_with_real_messages_gets_computed_avg_fps(self, monkeypatch):
-        # Relabel an existing, genuinely-recorded topic's schema as unclassified
-        # (the underlying MCAP channel is untouched, so decoding its real
-        # messages still works) to verify avg_fps is now computed from real
-        # timestamps for unclassified topics, using the same
-        # (n-1)/(span) formula already used for role="stream".
+    def test_unclassified_topic_with_real_messages_skips_avg_fps_in_fast_path(self, monkeypatch):
+        # Fast-path validator does not scan unclassified topics for timestamps.
+        # They remain informational-only, so avg_fps stays None even when the
+        # underlying channel really has messages.
         from mcap_converter.core import quality as quality_module
 
         real_info = quality_module._summary_topic_info(str(_STUB_MCAP))
@@ -650,31 +657,42 @@ class TestScanEpisodeIntegration:
         assert joint.role == ROLE_UNCLASSIFIED
         assert joint.severity == SEVERITY_PASS
         assert joint.message_count == 120
-        # Pinned to the same manually-verified span used by
-        # test_duration_matches_manually_verified_monitored_topic_timestamps:
-        # 120 messages spanning 0.0 -> 3.966666627s.
-        assert joint.avg_fps == pytest.approx(119 / 3.966666627, rel=1e-6)
+        assert joint.avg_fps is None
 
-    def test_unclassified_topic_with_single_message_has_no_avg_fps(self, monkeypatch):
-        # A single timestamp can't produce a meaningful average — same rule
-        # already applied to role="stream" topics.
+    def test_unclassified_topic_with_real_messages_gets_avg_fps_in_strict_mode(self, monkeypatch):
         from mcap_converter.core import quality as quality_module
 
         real_info = quality_module._summary_topic_info(str(_STUB_MCAP))
-        real_collect_timestamps = quality_module._collect_timestamps
+
+        def fake_summary_topic_info(mcap_path):
+            info = dict(real_info)
+            joint = info["/joint_states"]
+            info["/joint_states"] = _TopicSummary(count=joint.count, schema_name="custom_msgs/Unknown")
+            return info
+
+        monkeypatch.setattr(quality_module, "_summary_topic_info", fake_summary_topic_info)
+
+        report = scan_episode(str(_STUB_MCAP), QualityThresholds(), validation_mode="strict")
+
+        joint = next(t for t in report.topics if t.topic == "/joint_states")
+        assert joint.role == ROLE_UNCLASSIFIED
+        assert joint.severity == SEVERITY_PASS
+        assert joint.message_count == 120
+        assert joint.avg_fps == pytest.approx(119 / 3.966666627, rel=1e-6)
+
+    def test_unclassified_topic_with_single_message_has_no_avg_fps(self, monkeypatch):
+        # Fast path never scans unclassified timestamps, so avg_fps stays None
+        # regardless of message count.
+        from mcap_converter.core import quality as quality_module
+
+        real_info = quality_module._summary_topic_info(str(_STUB_MCAP))
 
         def fake_summary_topic_info(mcap_path):
             info = dict(real_info)
             info["/rosout"] = _TopicSummary(count=1, schema_name="rcl_interfaces/Log")
             return info
 
-        def fake_collect_timestamps(mcap_path, topics):
-            if topics == ["/rosout"]:
-                return {"/rosout": [1.23]}
-            return real_collect_timestamps(mcap_path, topics)
-
         monkeypatch.setattr(quality_module, "_summary_topic_info", fake_summary_topic_info)
-        monkeypatch.setattr(quality_module, "_collect_timestamps", fake_collect_timestamps)
 
         report = scan_episode(str(_STUB_MCAP), QualityThresholds())
 
@@ -688,25 +706,18 @@ class TestScanEpisodeIntegration:
         # A fast, wildly-out-of-session-range unclassified topic (like a real
         # high-rate /tf) must never shift session_start/session_end, since
         # that would risk mis-flagging gaps/severity on the real monitored
-        # stream/action topics. Its own fps is still computed and shown.
+        # stream/action topics. Fast path no longer computes its own fps.
         from mcap_converter.core import quality as quality_module
 
         baseline = scan_episode(str(_STUB_MCAP), QualityThresholds())
         real_info = quality_module._summary_topic_info(str(_STUB_MCAP))
-        real_collect_timestamps = quality_module._collect_timestamps
 
         def fake_summary_topic_info(mcap_path):
             info = dict(real_info)
             info["/tf"] = _TopicSummary(count=3, schema_name="tf2_msgs/TFMessage")
             return info
 
-        def fake_collect_timestamps(mcap_path, topics):
-            if topics == ["/tf"]:
-                return {"/tf": [-100.0, 0.0, 100.0]}
-            return real_collect_timestamps(mcap_path, topics)
-
         monkeypatch.setattr(quality_module, "_summary_topic_info", fake_summary_topic_info)
-        monkeypatch.setattr(quality_module, "_collect_timestamps", fake_collect_timestamps)
 
         report = scan_episode(str(_STUB_MCAP), QualityThresholds())
 
@@ -716,7 +727,7 @@ class TestScanEpisodeIntegration:
         tf = next(t for t in report.topics if t.topic == "/tf")
         assert tf.role == ROLE_UNCLASSIFIED
         assert tf.severity == SEVERITY_PASS
-        assert tf.avg_fps == pytest.approx(2 / 200.0)
+        assert tf.avg_fps is None
 
         baseline_by_topic = {t.topic: t for t in baseline.topics}
         for t in report.topics:
@@ -725,14 +736,7 @@ class TestScanEpisodeIntegration:
             assert t.severity == baseline_by_topic[t.topic].severity
             assert t.avg_fps == baseline_by_topic[t.topic].avg_fps
 
-    def test_unclassified_timestamp_decode_failure_degrades_without_crashing(self, monkeypatch):
-        # An unclassified topic can in principle be any ROS2 message type (or
-        # even a non-ROS2-encoded channel) — unlike the 3 well-tested
-        # monitored types. A decode failure while collecting its timestamps
-        # must degrade to avg_fps=None, not crash the whole scan, since
-        # unclassified topics are informational-only by design.
-        from mcap.exceptions import McapError
-
+    def test_unclassified_topics_do_not_call_collect_timestamps(self, monkeypatch):
         from mcap_converter.core import quality as quality_module
 
         real_info = quality_module._summary_topic_info(str(_STUB_MCAP))
@@ -743,9 +747,9 @@ class TestScanEpisodeIntegration:
             info["/rosout"] = _TopicSummary(count=5, schema_name="rcl_interfaces/Log")
             return info
 
-        def fake_collect_timestamps(mcap_path, topics):
+        def fake_collect_timestamps(mcap_path, topics, *, validation_mode="fast"):
             if topics == ["/rosout"]:
-                raise McapError("simulated decode failure for an exotic message type")
+                raise AssertionError("fast path should not scan unclassified topics")
             return real_collect_timestamps(mcap_path, topics)
 
         monkeypatch.setattr(quality_module, "_summary_topic_info", fake_summary_topic_info)
@@ -758,7 +762,6 @@ class TestScanEpisodeIntegration:
         assert rosout.message_count == 5
         assert rosout.avg_fps is None
         assert rosout.severity == SEVERITY_PASS
-        # The monitored stream/action topics' own scan must be unaffected.
         assert report.severity in (SEVERITY_PASS, SEVERITY_WARNING)
 
     def test_monitored_timestamp_decode_failure_produces_read_error_not_a_crash(self, monkeypatch):
@@ -773,7 +776,7 @@ class TestScanEpisodeIntegration:
 
         from mcap_converter.core import quality as quality_module
 
-        def fake_collect_timestamps(mcap_path, topics):
+        def fake_collect_timestamps(mcap_path, topics, *, validation_mode="fast"):
             raise McapError("simulated decode failure")
 
         monkeypatch.setattr(quality_module, "_collect_timestamps", fake_collect_timestamps)
@@ -794,6 +797,34 @@ class TestScanEpisodeIntegration:
         assert report.severity == SEVERITY_CRITICAL
         assert report.read_error is not None
         assert report.topics == []
+
+    def test_strict_mode_scans_unclassified_topics(self, monkeypatch):
+        from mcap_converter.core import quality as quality_module
+
+        real_info = quality_module._summary_topic_info(str(_STUB_MCAP))
+        real_collect_timestamps = quality_module._collect_timestamps
+
+        def fake_summary_topic_info(mcap_path):
+            info = dict(real_info)
+            info["/rosout"] = _TopicSummary(count=5, schema_name="rcl_interfaces/Log")
+            return info
+
+        seen = {"rosout": False}
+
+        def fake_collect_timestamps(mcap_path, topics, *, validation_mode="fast"):
+            if topics == ["/rosout"]:
+                seen["rosout"] = True
+                return {"/rosout": [1.0, 2.0, 3.0]}
+            return real_collect_timestamps(mcap_path, topics, validation_mode=validation_mode)
+
+        monkeypatch.setattr(quality_module, "_summary_topic_info", fake_summary_topic_info)
+        monkeypatch.setattr(quality_module, "_collect_timestamps", fake_collect_timestamps)
+
+        report = scan_episode(str(_STUB_MCAP), QualityThresholds(), validation_mode="strict")
+
+        assert seen["rosout"] is True
+        rosout = next(t for t in report.topics if t.topic == "/rosout")
+        assert rosout.avg_fps == pytest.approx(1.0)
 
     def test_corrupt_file_produces_read_error_not_a_misleading_report(self, tmp_path):
         garbage_file = tmp_path / "corrupt.mcap"
@@ -833,6 +864,44 @@ class TestMcapValidCli:
         assert "episodes" in payload
         assert len(payload["episodes"]) == 1
         assert exit_code == 0
+
+    def test_validation_mode_defaults_to_fast_and_accepts_strict(
+        self, tmp_path, monkeypatch, capsys, stub_mcap_copy
+    ):
+        from mcap_converter.cli import mcap_valid as cli_module
+
+        monkeypatch.chdir(tmp_path)
+        seen: list[str] = []
+
+        def fake_scan_episode(mcap_path, thresholds, *, validation_mode="fast"):
+            seen.append(validation_mode)
+            return EpisodeQualityReport(
+                path=mcap_path,
+                duration_s=1.0,
+                severity=SEVERITY_PASS,
+                passed=True,
+                topics=[],
+            )
+
+        monkeypatch.setattr(cli_module, "scan_episode", fake_scan_episode)
+
+        exit_code = cli_module.main([
+            "-i", str(stub_mcap_copy),
+            "--format", "json",
+        ])
+        capsys.readouterr()
+        assert exit_code == 0
+        assert seen == ["fast"]
+
+        seen.clear()
+        exit_code = cli_module.main([
+            "-i", str(stub_mcap_copy),
+            "--format", "json",
+            "--validation-mode", "strict",
+        ])
+        capsys.readouterr()
+        assert exit_code == 0
+        assert seen == ["strict"]
 
     def test_fail_on_critical_exits_nonzero_when_critical_present(self, tmp_path, monkeypatch):
         from mcap_converter.cli.mcap_valid import main

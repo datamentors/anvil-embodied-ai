@@ -48,7 +48,7 @@ def _patch_resume_video_continuation(dataset: LeRobotDataset) -> None:
     implementation details of the third-party `lerobot` package, not a
     contract lerobot guarantees to keep stable across versions. This repo
     currently pins `lerobot~=0.5.0` (see
-    packages/mcap_converter/pyproject.toml). If that pin is ever bumped
+    packages/mcap_convert_gpu/pyproject.toml). If that pin is ever bumped
     (including a patch/minor bump within the `~=0.5.0` range, or a move to
     0.6.x+), this function MUST be re-verified against the new version's
     `dataset_writer.py` (`_save_episode_video`) and `dataset_metadata.py`
@@ -58,7 +58,7 @@ def _patch_resume_video_continuation(dataset: LeRobotDataset) -> None:
     as a silent behavioral regression (extra video chunk files reappear) or
     a `KeyError`/`AttributeError` at conversion time.
 
-    `tests/unit/mcap_converter/test_resume_video_continuation.py` is the
+    `tests/unit/mcap_convert_gpu/test_resume_video_continuation.py` is the
     regression test that would catch a real behavioral break here, and it
     catches more than it might seem at first:
     - If lerobot renames or removes `_save_episode_video` entirely, the line

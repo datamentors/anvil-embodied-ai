@@ -10,17 +10,18 @@ import contextlib
 import json
 import multiprocessing
 import os
+import re
 import shutil
 import stat
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import List
 
-import av
 import huggingface_hub
 from rich.console import Console, Group
 from rich.markup import escape
@@ -33,20 +34,21 @@ from rich.progress import (
     SpinnerColumn,
     TextColumn,
     TimeElapsedColumn,
+    TimeRemainingColumn,
 )
 from rich.table import Table
 
 from anvil_shared.provenance import git_provenance
-from mcap_converter import (
+from mcap_convert_gpu import (
     ConfigLoader,
     DataConfig,
     LeRobotWriter,
     McapReader,
 )
-from mcap_converter.cli.mcap_valid import default_report_paths
-from mcap_converter.core.extractor import BufferedStreamExtractor
-from mcap_converter.core.quality import SEVERITY_CRITICAL, SEVERITY_PASS, SEVERITY_WARNING
-from mcap_converter.core.reader import snap_fps
+from mcap_convert_gpu.cli.mcap_valid import default_report_paths
+from mcap_convert_gpu.core.extractor import BufferedStreamExtractor
+from mcap_convert_gpu.core.quality import SEVERITY_CRITICAL, SEVERITY_PASS, SEVERITY_WARNING
+from mcap_convert_gpu.core.reader import snap_fps
 
 console = Console()
 
@@ -57,7 +59,7 @@ _PROFILE_DEFAULTS = {
         "description": "Convert MCAP recordings to LeRobot v3.0 dataset format",
         "examples": """\
 examples:
-  mcap-convert -i data/raw/my-session -o data/datasets --config configs/mcap_converter/openarm_bimanual.yaml
+  mcap-convert -i data/raw/my-session -o data/datasets --config configs/mcap_convert_gpu/openarm_bimanual.yaml
   # output goes to data/datasets/my-session/
 
   mcap-convert -i data/raw/my-session -o data/datasets --vcodec libsvtav1
@@ -81,7 +83,7 @@ examples:
         "description": "Convert MCAP recordings to LeRobot datasets using the GPU-optimized path",
         "examples": """\
 examples:
-  mcap-convert-gpu -i data/raw/my-session -o data/datasets --config configs/mcap_converter/openarm_bimanual.yaml
+  mcap-convert-gpu -i data/raw/my-session -o data/datasets --config configs/mcap_convert_gpu/openarm_bimanual.yaml
   # output goes to data/datasets/my-session/
 
   mcap-convert-gpu -i data/raw/my-session -o data/datasets --vcodec auto
@@ -90,7 +92,7 @@ examples:
   mcap-convert-gpu -i data/raw/my-session -o data/datasets --resume
   mcap-convert-gpu -i data/raw/my-session -o data/datasets --include-flagged critical
 """,
-        "default_vcodec": "auto",
+        "default_vcodec": "h264",
         "default_debug_plot_episodes": 0,
         "streaming_encoding": True,
         "encoder_queue_maxsize": 240,
@@ -212,28 +214,68 @@ def plan_episode_shards(mcap_files: List[Path], worker_count: int) -> List[List[
     return shards
 
 
-def _codec_available(codec_name: str) -> bool:
-    """Return whether PyAV/FFmpeg can open this encoder on the current machine."""
-    try:
-        av.codec.Codec(codec_name, "w")
-        return True
-    except Exception:
-        return False
+# Matches the per-episode completion line each shard worker writes to its own
+# log (see convert_session's "  ✓ [i/N] filename  X frames  Ys  Z f/s" print).
+# Shard logs may or may not carry ANSI/Rich markup depending on how Rich's
+# terminal detection resolves inside a redirected-to-file subprocess, so this
+# strips escape codes first rather than trying to match around them.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+_EPISODE_DONE_RE = re.compile(r"✓\s*\[(\d+)/(\d+)\]")
 
 
-def resolve_profile_vcodec(profile: str, requested_vcodec: str) -> str:
-    """Resolve a profile-specific preferred codec without breaking portability.
+def _count_completed_episodes(log_path: Path) -> int:
+    """Return how many episode-completion lines a shard's log has printed so far.
 
-    For the GPU path, prefer HEVC NVENC when available because it benchmarked
-    faster than the current auto-selected H.264 NVENC on the workstation.
+    Reads the whole file each call rather than tailing incrementally — shard
+    logs are tiny (a few KB per episode) and polled at most once a second, so
+    a full re-read is cheap and avoids tracking per-file byte offsets.
     """
-    if profile != "gpu":
-        return requested_vcodec
-    if requested_vcodec != "auto":
-        return requested_vcodec
-    if _codec_available("hevc_nvenc"):
-        return "hevc_nvenc"
-    return requested_vcodec
+    try:
+        text = log_path.read_text(errors="ignore")
+    except OSError:
+        return 0
+    return len(_EPISODE_DONE_RE.findall(_ANSI_ESCAPE_RE.sub("", text)))
+
+
+def _run_shard_progress_aggregator(
+    *,
+    shard_log_paths: list[Path],
+    total_episodes: int,
+    stop_event: threading.Event,
+    poll_interval_s: float = 1.0,
+) -> None:
+    """Poll shard log files and render one combined progress bar with ETA.
+
+    Runs in a background thread in the MAIN process while the
+    ProcessPoolExecutor futures are pending in convert_session(). Each shard
+    worker's own progress prints are redirected into its own log file (so N
+    workers don't garble one terminal) — this thread is what turns those N
+    silent log files back into a single live signal for the user, instead of
+    the parallel path going dark until all shards finish.
+    """
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]Converting episodes (parallel)"),
+        BarColumn(bar_width=40),
+        MofNCompleteColumn(),
+        TextColumn("[dim]|[/dim]"),
+        TimeElapsedColumn(),
+        TextColumn("[dim]ETA[/dim]"),
+        TimeRemainingColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        task = progress.add_task("episodes", total=total_episodes, completed=0)
+        while not stop_event.is_set():
+            done = sum(_count_completed_episodes(p) for p in shard_log_paths)
+            progress.update(task, completed=min(done, total_episodes))
+            if done >= total_episodes:
+                break
+            stop_event.wait(poll_interval_s)
+        # Final read after shards report completion — a shard can finish its
+        # log write a moment after its future resolves, so catch any last line.
+        done = sum(_count_completed_episodes(p) for p in shard_log_paths)
+        progress.update(task, completed=min(done, total_episodes))
 
 
 # Single source of truth for severity ordering, shared with core/quality.py's
@@ -585,7 +627,7 @@ def convert_session(
         config = ConfigLoader.get_default()
 
     if streaming_encoding:
-        from mcap_converter.core.gpu_runtime import apply_gpu_runtime_patches
+        from mcap_convert_gpu.core.gpu_runtime import apply_gpu_runtime_patches
 
         apply_gpu_runtime_patches()
 
@@ -652,6 +694,8 @@ def convert_session(
 
             config_dict = asdict(config)
             shard_results: list[dict] = []
+            shard_log_paths: list[Path] = []
+            future_map_by_index: dict[int, int] = {}
             try:
                 with concurrent.futures.ProcessPoolExecutor(
                     max_workers=len(shards),
@@ -659,6 +703,7 @@ def convert_session(
                 ) as executor:
                     future_map = {}
                     for shard_index, shard_files in enumerate(shards):
+                        future_map_by_index[shard_index] = len(shard_files)
                         shard_output_dir = shard_root / f"shard-{shard_index:03d}"
                         shard_repo_id = f"{repo_id}-shard-{shard_index:03d}"
                         shard_gpu_id = (shard_index % gpu_count) if gpu_count > 0 else None
@@ -684,11 +729,35 @@ def convert_session(
                             gpu_id=shard_gpu_id,
                         )
                         future_map[future] = (shard_index, len(shard_files))
+                        shard_log_paths.append(shard_output_dir.parent / f"shard-{shard_index:03d}.log")
 
-                    for future in concurrent.futures.as_completed(future_map):
-                        shard_index, shard_episodes = future_map[future]
-                        result = future.result()
-                        shard_results.append(result)
+                    aggregator_stop = threading.Event()
+                    aggregator_thread = None
+                    if use_live_progress:
+                        aggregator_thread = threading.Thread(
+                            target=_run_shard_progress_aggregator,
+                            kwargs={
+                                "shard_log_paths": shard_log_paths,
+                                "total_episodes": len(included_mcap_files),
+                                "stop_event": aggregator_stop,
+                            },
+                            daemon=True,
+                        )
+                        aggregator_thread.start()
+
+                    try:
+                        for future in concurrent.futures.as_completed(future_map):
+                            shard_index, shard_episodes = future_map[future]
+                            result = future.result()
+                            shard_results.append(result)
+                    finally:
+                        aggregator_stop.set()
+                        if aggregator_thread is not None:
+                            aggregator_thread.join()
+
+                    for result in sorted(shard_results, key=lambda r: r["shard_index"]):
+                        shard_index = result["shard_index"]
+                        shard_episodes = future_map_by_index[shard_index]
                         gpu_label = (
                             f"  [dim](gpu {result['gpu_id']})[/dim]" if result.get("gpu_id") is not None else ""
                         )
@@ -707,7 +776,7 @@ def convert_session(
                 _ensure_output_readable(output_dir)
 
                 if dataset.meta.total_frames > 0 and debug_plot_episodes > 0:
-                    from mcap_converter.utils.debug_plot import plot_conversion_debug
+                    from mcap_convert_gpu.utils.debug_plot import plot_conversion_debug
 
                     with console.status("[bold]Generating debug plots..."):
                         plot_conversion_debug(
@@ -1057,7 +1126,7 @@ def convert_session(
 
     # Debug plots: generated only when explicitly enabled for at least 1 episode
     if total_frames > 0 and debug_plot_episodes > 0:
-        from mcap_converter.utils.debug_plot import plot_conversion_debug
+        from mcap_convert_gpu.utils.debug_plot import plot_conversion_debug
         with console.status("[bold]Generating debug plots..."):
             plot_conversion_debug(
                 output_dir,
@@ -1212,6 +1281,22 @@ def build_parser(profile: str = "standard") -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--gpu-id",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "pin this ENTIRE run to a single physical GPU by index (sets "
+            "CUDA_VISIBLE_DEVICES before conversion starts). Use this to run "
+            "one independent conversion per GPU — launch separate processes "
+            "with --gpu-id 0, --gpu-id 1, etc., each converting a different "
+            "input dir at the same time. Combine with --parallel-episodes to "
+            "still shard episodes within that one GPU. Omit to let this run "
+            "use whatever GPUs are visible (e.g. all 4, via --parallel-episodes "
+            "shard round-robin)."
+        ),
+    )
+    parser.add_argument(
         "--quality-report", type=str, default=None,
         help=(
             "path to a mcap-valid JSON report. A report is REQUIRED to run mcap-convert — "
@@ -1251,6 +1336,17 @@ def main_with_profile(args=None, profile: str = "standard"):
     defaults = _PROFILE_DEFAULTS[profile]
     parser = build_parser(profile=profile)
     args = parser.parse_args(args)
+
+    # --gpu-id pins the WHOLE process (and anything it later spawns) to one
+    # physical GPU. Must happen before any CUDA-touching import (torch, PyAV's
+    # NVENC) — those are all lazy/deferred past this point in this module, so
+    # setting the env var here is early enough. detect_gpu_count() called
+    # later (for --parallel-episodes auto / shard round-robin) will then only
+    # ever see this one GPU, which is the correct, intended restriction.
+    if args.gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+        log(f"Pinned entire run to GPU [bold]{args.gpu_id}[/bold] (CUDA_VISIBLE_DEVICES={args.gpu_id})")
+
     requested_parallel_workers = (
         defaults["parallel_episode_workers"]
         if args.parallel_episodes is None
@@ -1386,6 +1482,7 @@ def main_with_profile(args=None, profile: str = "standard"):
     banner.add_row("Profile", defaults["label"])
     banner.add_row("Video codec", args.vcodec)
     banner.add_row("Parallel episodes", "auto" if requested_parallel_workers == 0 else str(requested_parallel_workers))
+    banner.add_row("GPU", str(args.gpu_id) if args.gpu_id is not None else "all visible")
     banner.add_row("Resume", "yes" if args.resume else "no")
     banner.add_row("Max episodes", str(args.max_episodes) if args.max_episodes else "all")
     if config.action_from_observation:
