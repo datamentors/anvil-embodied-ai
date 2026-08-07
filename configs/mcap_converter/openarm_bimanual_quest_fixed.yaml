@@ -122,8 +122,6 @@ action_feature_mapping:
 #   observation.velocity  [16]  = [left_joints..., right_joints...]  (from follower)
 #   observation.effort    [16]  = [left_joints..., right_joints...]  (from follower)
 #   action                [16]  = [left_joints..., right_joints...]  (from command topics)
-#   observation.images.waist    = camera0 frames
-#   observation.images.chest    = camera2 frames
-#   observation.images.wrist_r  = camera1 frames
-#   observation.images.wrist_l  = camera3 frames
-
+#   observation.images.base       = chest camera frames
+#   observation.images.right_wrist = wrist_r camera frames
+#   observation.images.left_wrist  = wrist_l camera frames

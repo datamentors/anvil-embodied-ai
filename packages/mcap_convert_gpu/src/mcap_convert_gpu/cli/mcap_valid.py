@@ -26,7 +26,7 @@ from rich.markup import escape
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TimeElapsedColumn
 from rich.table import Table
 
-from mcap_converter.core.quality import (
+from mcap_convert_gpu.core.quality import (
     ROLE_ACTION,
     ROLE_STREAM,
     ROLE_UNCLASSIFIED,
@@ -38,7 +38,7 @@ from mcap_converter.core.quality import (
     apply_batch_topic_presence_check,
     scan_episode,
 )
-from mcap_converter.core.schema_inspect import inspect_message_structure, render_structure_text
+from mcap_convert_gpu.core.schema_inspect import inspect_message_structure, render_structure_text
 
 console = Console()
 # Status/progress notices (e.g. "report written to ...") go to stderr so they

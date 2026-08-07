@@ -42,6 +42,7 @@ dev = [
 [tool.uv.workspace]
 members = [
     "packages/mcap_converter",
+    "packages/mcap_convert_gpu",
     "packages/anvil_trainer",
     "packages/anvil_eval",
     "packages/anvil_eval_ros",
@@ -84,7 +85,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["mcap_converter", "anvil_trainer", "anvil_eval"]
+known-first-party = ["mcap_converter", "mcap_convert_gpu", "anvil_trainer", "anvil_eval"]
 
 [tool.pyright]
 pythonVersion = "3.12"

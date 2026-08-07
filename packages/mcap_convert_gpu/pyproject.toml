@@ -3,16 +3,16 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mcap-converter"
+name = "mcap-convert-gpu"
 version = "0.1.0"
-description = "MCAP to LeRobot Dataset Converter - A modular conversion pipeline for transforming ROS2 MCAP recordings into LeRobot v3.0 format datasets"
+description = "GPU-optimized MCAP to LeRobot Dataset Converter — NVENC streaming encode, multi-GPU shard parallelism"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.12"
 authors = [
     { name = "Anvil Robotics" }
 ]
-keywords = ["mcap", "lerobot", "ros2", "robotics", "dataset", "conversion"]
+keywords = ["mcap", "lerobot", "ros2", "robotics", "dataset", "conversion", "gpu", "nvenc"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -34,6 +34,8 @@ dependencies = [
     "pyyaml~=6.0",
     "huggingface-hub>=1.0.0,<2.0.0",
     "rich>=13.0",
+    "av",
+    "torch",
 ]
 
 [project.optional-dependencies]
@@ -46,21 +48,18 @@ dev = [
 ]
 
 [project.scripts]
-mcap-convert = "mcap_converter.cli.convert:main"
-mcap-convert-gpu = "mcap_converter.cli.convert_gpu:main"
-dataset-valid = "mcap_converter.cli.validate:main"
-dataset-viz = "mcap_converter.cli.dataset_viz:main"
-hf-upload = "mcap_converter.cli.upload:main"
-mcap-to-video = "mcap_converter.cli.video:main"
-merge-datasets = "mcap_converter.cli.merge_datasets:main"
-mcap-valid = "mcap_converter.cli.mcap_valid:main"
+# Only the GPU-specific entrypoint is exposed here. The shared utility CLIs
+# (dataset-viz, hf-upload, mcap-to-video, merge-datasets, mcap-valid) are
+# already registered by the mcap-converter package — both packages live in
+# the same uv workspace venv, so duplicate script names would collide.
+mcap-convert-gpu = "mcap_convert_gpu.cli.convert_gpu:main"
 
 [project.urls]
 Homepage = "https://github.com/anvil-robotics/anvil-embodied-ai"
 Repository = "https://github.com/anvil-robotics/anvil-embodied-ai"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mcap_converter"]
+packages = ["src/mcap_convert_gpu"]
 
 [tool.hatch.build.targets.sdist]
 include = [
