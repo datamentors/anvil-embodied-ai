@@ -1,0 +1,75 @@
+# =============================================================================
+# OpenArm MCAP to LeRobot Conversion Configuration
+# =============================================================================
+# Teleop Mode: Quest (VR Controller) — BIMANUAL, ACTION-FROM-OBS FALLBACK
+#
+# Use this variant for bimanual Quest recordings where the explicit action
+# command topics may be missing in some or all episodes. Actions are then
+# derived from follower observations instead of failing conversion.
+#
+# This config also targets the 3-camera layout:
+#   - /cam_wrist_r/image_raw/compressed
+#   - /cam_chest/image_raw/compressed
+#   - /cam_wrist_l/image_raw/compressed
+# =============================================================================
+
+robot_state_topic: "/joint_states"
+
+
+# =============================================================================
+# Joint Name Parsing
+# =============================================================================
+joint_names:
+  separator: "_"
+
+  source:
+    follower: observation
+
+  arms:
+    r: right
+    l: left
+
+
+# =============================================================================
+# Action Topics (Quest Teleop)
+# =============================================================================
+action_topics:
+  "/follower_l_forward_position_controller/commands":
+    arm: "left"
+    joint_order: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7", "finger_joint1"]
+  "/follower_r_forward_position_controller/commands":
+    arm: "right"
+    joint_order: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7", "finger_joint1"]
+
+# If action command topics are absent in the MCAP, derive action[t] from
+# observation[t + n] instead of failing conversion.
+action_from_observation: true
+action_from_observation_n: 10
+
+
+# =============================================================================
+# Camera Configuration
+# =============================================================================
+camera_topics:
+  - "/cam_wrist_r/image_raw/compressed"
+  - "/cam_chest/image_raw/compressed"
+  - "/cam_wrist_l/image_raw/compressed"
+
+camera_topic_mapping:
+  "/cam_wrist_r/image_raw/compressed": "right_wrist"
+  "/cam_chest/image_raw/compressed": "base"
+  "/cam_wrist_l/image_raw/compressed": "left_wrist"
+
+image_resolution: [640, 480]
+
+
+# =============================================================================
+# Feature Extraction
+# =============================================================================
+observation_feature_mapping:
+  state: "position"
+  others: []
+
+action_feature_mapping:
+  state: "position"
+  others: []
