@@ -586,6 +586,13 @@ class BufferedStreamExtractor:
         self.progress_every = max(1, progress_every)
         self._last_reported_frames = -1
 
+        if self.config.action_from_observation:
+            n = self.config.action_from_observation_n
+            if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+                raise ValueError(
+                    "action_from_observation_n must be positive when "
+                    "action_from_observation=true"
+                )
         # Joint name pattern for parsing (reuse from DataExtractor)
         self._joint_pattern = config.joint_name_pattern
 
@@ -721,6 +728,7 @@ class BufferedStreamExtractor:
         cursor = 0  # Index of frame to process next
         frames_yielded = 0
         next_yield_ts = None  # Next target timestamp for subsampling
+        afo_pending_frames: deque = deque()
 
         for message in reader.read_messages(topics=all_topics):
             topic = message.channel.topic
@@ -769,9 +777,12 @@ class BufferedStreamExtractor:
                         camera_buffers, joint_buffers, cursor, main_cam, task, resize_image
                     )
                     if frame is not None:
-                        yield frame
-                        frames_yielded += 1
                         next_yield_ts += self.frame_interval
+                        if self.config.action_from_observation:
+                            frame = self._finalize_afo_frame(afo_pending_frames, frame)
+                        if frame is not None:
+                            yield frame
+                            frames_yielded += 1
 
                 cursor += 1
 
@@ -796,17 +807,27 @@ class BufferedStreamExtractor:
             print("[BufferedStream] Flushing remaining buffer...")
         while cursor < len(camera_buffers[main_cam]):
             frame_ts = camera_buffers[main_cam][cursor][0]
-            if next_yield_ts is None or frame_ts >= next_yield_ts:
+            if next_yield_ts is None:
+                next_yield_ts = frame_ts
+            if frame_ts >= next_yield_ts:
                 frame = self._align_frame_at_cursor(
                     camera_buffers, joint_buffers, cursor, main_cam, task, resize_image
                 )
                 if frame is not None:
-                    yield frame
-                    frames_yielded += 1
-                    if next_yield_ts is not None:
-                        next_yield_ts += self.frame_interval
-                    self._emit_progress(frames_yielded)
+                    next_yield_ts += self.frame_interval
+                    if self.config.action_from_observation:
+                        frame = self._finalize_afo_frame(afo_pending_frames, frame)
+                    if frame is not None:
+                        yield frame
+                        frames_yielded += 1
+                        self._emit_progress(frames_yielded)
             cursor += 1
+
+        if self.config.action_from_observation and afo_pending_frames and not self.quiet:
+            print(
+                f"[BufferedStream] Dropping final {len(afo_pending_frames)} frame(s): "
+                "no future observation is available for the configured AFO lookahead"
+            )
 
         self._emit_progress(frames_yielded, force=True)
 
@@ -820,13 +841,19 @@ class BufferedStreamExtractor:
                 f"{role}:{robot or 'default'}": len(d["buffer"])
                 for (role, robot), d in joint_buffers.items()
             }
-            print(f"[BufferedStream] WARNING: 0 frames produced — diagnostics:")
+            print("[BufferedStream] WARNING: 0 frames produced — diagnostics:")
             print(f"  Camera buffers: {cam_counts}")
             print(
                 f"  Joint buffers:  {joint_keys if joint_keys else '(empty — no joint data received)'}"
             )
+            if self.config.action_from_observation and afo_pending_frames:
+                print(
+                    f"  -> {len(afo_pending_frames)} aligned frame(s) are not enough for "
+                    f"action_from_observation_n={self.config.action_from_observation_n}; "
+                    "the episode needs more than N frames"
+                )
             if not cam_counts or all(c == 0 for c in cam_counts.values()):
-                print(f"  -> No camera images found. Check that these topics exist in the MCAP:")
+                print("  -> No camera images found. Check that these topics exist in the MCAP:")
                 for t in self.config.camera_topics:
                     print(f"       {t}")
             if not joint_keys:
@@ -837,14 +864,17 @@ class BufferedStreamExtractor:
                     print(
                         f"  -> No action data. Check action_topics: {list(self.config.action_topics.keys())}"
                     )
-            elif not any(k.startswith("action:") for k in joint_keys):
+            elif (
+                not self.config.action_from_observation
+                and not any(k.startswith("action:") for k in joint_keys)
+            ):
                 if self.config.action_topics:
-                    print(f"  -> No action data received from action_topics:")
+                    print("  -> No action data received from action_topics:")
                     for t in self.config.action_topics:
                         print(f"       {t}")
                 else:
                     print(
-                        f"  -> No action data parsed from joint_states (no leader prefix matched)."
+                        "  -> No action data parsed from joint_states (no leader prefix matched)."
                     )
 
     def _align_frame_at_cursor(
@@ -895,18 +925,14 @@ class BufferedStreamExtractor:
             else:
                 return None
 
-        # Align joint states
-        if joint_buffers:
-            has_action_buffer = any(role == "action" for (role, _) in joint_buffers)
-            action_ts = (
-                main_ts + self.frame_interval * self.config.action_from_observation_n
-                if self.config.action_from_observation and not has_action_buffer
-                else None
-            )
-            joint_aligned = self._align_joint_states(joint_buffers, main_ts, action_ts=action_ts)
-            if joint_aligned is None:
-                return None  # Skip frame if joint states not available
-            frame.update(joint_aligned)
+        # Align joint states. In AFO mode this produces observation-only frames;
+        # extract_frames() fills their actions from the frame N positions ahead.
+        if not joint_buffers:
+            return None
+        joint_aligned = self._align_joint_states(joint_buffers, main_ts)
+        if joint_aligned is None or "observation.state" not in joint_aligned:
+            return None  # Skip frame if joint states are missing or incomplete
+        frame.update(joint_aligned)
 
         frame["task"] = task
         return frame
@@ -915,7 +941,6 @@ class BufferedStreamExtractor:
         self,
         joint_buffers: Dict[Tuple[str, str], Dict],
         target_ts: float,
-        action_ts: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Align joint states to target timestamp.
@@ -927,10 +952,6 @@ class BufferedStreamExtractor:
         Args:
             joint_buffers: Joint state buffers keyed by (role, robot)
             target_ts: Target timestamp for observation alignment
-            action_ts: If provided, look up observation data at this timestamp as
-                       the action (used with action_from_observation=True so that
-                       action[t] = observation[t+1] rather than observation[t]).
-
         Returns:
             Dictionary with aligned joint state features, or None if data missing
         """
@@ -961,38 +982,26 @@ class BufferedStreamExtractor:
             }
 
         # Pass 2: action — forward-fill instead of dropping the whole frame
-        # when the arm is disengaged. See _resolve_action_position docstring
-        # for the fallback order.
-        for (role, robot), data in joint_buffers.items():
-            if role != "action":
-                continue
-            pos, fill_kind = self._resolve_action_position(
-                robot, data["buffer"], target_ts, obs_data
-            )
-            self._record_action_fill(robot, fill_kind)
-            if pos is None:
-                return None  # No action and no observation fallback available
-            action_data[robot] = {"pos": pos}
-
-        # Fallback: use observation at action_ts (t+1) as action when action_topics
-        # are configured but not recorded in this MCAP.
-        if not action_data and obs_data and self.config.action_from_observation:
-            if action_ts is None:
-                # No next timestamp available (last frame) — skip this frame
-                return None
-            action_data = {}
+        # when the arm is disengaged. AFO is an explicit source selection, so
+        # command buffers are ignored and extract_frames() supplies action[t]
+        # from observation.state[t + N].
+        if not self.config.action_from_observation:
             for (role, robot), data in joint_buffers.items():
-                if role != "observation":
+                if role != "action":
                     continue
-                buffer = data["buffer"]
-                action_idx = self._find_nearest_in_buffer(buffer, action_ts)
-                if action_idx is None:
-                    return None
-                _, pos, _, _ = buffer[action_idx]
-                action_data[robot] = {"pos": pos.copy()}
+                pos, fill_kind = self._resolve_action_position(
+                    robot, data["buffer"], target_ts, obs_data
+                )
+                self._record_action_fill(robot, fill_kind)
+                if pos is None:
+                    return None  # No action and no observation fallback available
+                action_data[robot] = {"pos": pos}
 
         # Check if multi-robot (has named robots like 'left', 'right')
-        robots = sorted([r for r in set(obs_data.keys()) | set(action_data.keys()) if r])
+        robot_names = {r for r in set(obs_data) | set(action_data) if r}
+        if self.config.action_from_observation:
+            robot_names.update(topic.arm for topic in self.config.action_topics.values() if topic.arm)
+        robots = sorted(robot_names)
 
         if robots:
             # Multi-robot: require ALL robots to have both observation and action data
@@ -1000,7 +1009,7 @@ class BufferedStreamExtractor:
             for r in robots:
                 if r not in obs_data:
                     return None  # Observation data not yet available for this arm
-                if r not in action_data:
+                if not self.config.action_from_observation and r not in action_data:
                     return None  # Action data not yet available for this arm
 
             # Multi-robot: concatenate in sorted order (left, right)
@@ -1026,8 +1035,8 @@ class BufferedStreamExtractor:
                     result["observation.effort"] = np.concatenate(obs_efforts)
 
             # Concatenate action
-            action_positions = [action_data[r]["pos"] for r in robots]
-            if action_positions:
+            if action_data:
+                action_positions = [action_data[r]["pos"] for r in robots]
                 result["action"] = np.concatenate(action_positions)
 
             return result
@@ -1048,6 +1057,37 @@ class BufferedStreamExtractor:
                 result["action"] = action_data[""]["pos"]
 
             return result
+
+    def _finalize_afo_frame(
+        self,
+        pending_frames: deque,
+        current_frame: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Return the frame N steps behind ``current_frame`` with its action set.
+
+        Pending frames are indexed after camera subsampling and joint alignment,
+        so this implements the documented frame contract exactly:
+        ``action[t] = observation.state[t + N]``. The final N pending frames are
+        intentionally left unreturned because their future target does not exist.
+        """
+        future_state = current_frame.get("observation.state")
+        if future_state is None:
+            raise DataExtractionError(
+                "action_from_observation requires an observation.state feature"
+            )
+
+        pending_frames.append(current_frame)
+        n = self.config.action_from_observation_n
+        if len(pending_frames) <= n:
+            return None
+
+        ready_frame = pending_frames.popleft()
+        if "observation.state" not in ready_frame:
+            raise DataExtractionError(
+                "action_from_observation requires an observation.state feature"
+            )
+        ready_frame["action"] = future_state.copy()
+        return ready_frame
 
     def _find_nearest_in_buffer(
         self,
@@ -1149,8 +1189,16 @@ class BufferedStreamExtractor:
             ):
                 self.progress_callback(frames_yielded)
                 self._last_reported_frames = frames_yielded
-        elif not self.quiet and (force or frames_yielded % 100 == 0):
+        elif not self.quiet and (
+            force
+            or (
+                frames_yielded > 0
+                and frames_yielded % 100 == 0
+                and frames_yielded != self._last_reported_frames
+            )
+        ):
             print(f"[BufferedStream] Processed {frames_yielded} frames...")
+            self._last_reported_frames = frames_yielded
 
     def _compile_joint_layout(
         self,
@@ -1196,20 +1244,20 @@ class BufferedStreamExtractor:
         """
         Create the initial joint_buffers dict for a new extraction run.
 
-        Pre-seeds an empty ("action", robot) entry for every robot configured
-        in action_topics, so _align_joint_states's action pass always visits
-        every configured robot from the first frame onward — even before that
-        robot has published its first command. Without this, a robot with no
-        live command yet would have no key in joint_buffers at all, and
-        _resolve_action_position's "fallback_to_observation" tier would never
-        be reached: the frame would instead be silently dropped by the
-        multi-robot consistency check further down in _align_joint_states.
+        In command-action mode, pre-seeds an empty ("action", robot) entry for
+        every robot configured in action_topics, so _align_joint_states's action
+        pass always visits every configured robot from the first frame onward.
+        AFO mode deliberately skips these entries because command topics are
+        ignored and actions are derived from future observation frames.
 
         Observation keys are NOT pre-seeded here — they're always created
         densely and immediately by _buffer_joint_state from the continuous
         /joint_states stream, so there's no equivalent gap for them.
         """
         joint_buffers: Dict[Tuple[str, str], Dict] = {}
+        if self.config.action_from_observation:
+            return joint_buffers
+
         for topic_cfg in self.config.action_topics.values():
             key = ("action", topic_cfg.arm)
             joint_names = sorted(topic_cfg.joint_order) if topic_cfg.joint_order else []

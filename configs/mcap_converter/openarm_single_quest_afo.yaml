@@ -53,11 +53,11 @@ action_topics:
     arm: "right"
     joint_order: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7", "finger_joint1"]
 
-# When the action command topic is not present in the MCAP (e.g., topic was not
-# recorded), fall back to using the follower observation positions as the action.
+# Derive actions from future follower observations and ignore command topics,
+# even if they are present in the recording.
 action_from_observation: true
-# action[t] = observation[t + n]. Default: 10 (≈333ms at 30fps).
-# action_from_observation_n: 10
+# action[t] = observation[t + n] (≈333ms at 30fps).
+action_from_observation_n: 10
 
 
 # =============================================================================
@@ -92,9 +92,7 @@ observation_feature_mapping:
     # - "velocity"        # -> observation.velocity
     # - "effort"          # -> observation.effort
 
-# What to extract from action commands
-# Note: Float64MultiArray only contains position commands,
-# so 'others' should remain empty for quest mode.
+# Feature layout for actions derived from future observations.
 action_feature_mapping:
   state: "position"      # Primary feature -> action
   others: []             # No additional action features
@@ -105,23 +103,19 @@ action_feature_mapping:
 #
 # Input (ROS topics):
 #   /joint_states (sensor_msgs/JointState):
-#     name: ["follower_r_joint1", ..., "follower_l_joint1", ...]
-#     position: [0.1, 0.2, ..., 0.3, ...]
-#     velocity: [0.01, 0.02, ..., 0.03, ...]
-#     effort: [1.0, 2.0, ..., 3.0, ...]
+#     name: ["follower_r_joint1", ..., "follower_r_finger_joint1"]
+#     position: [0.1, 0.2, ..., 0.8]
+#     velocity: [0.01, 0.02, ..., 0.08]
+#     effort: [1.0, 2.0, ..., 8.0]
 #
-#   /follower_l_forward_position_controller/commands (Float64MultiArray):
-#     data: [0.1, 0.2, ..., 0.8]     # left arm target positions
-#
-#   /follower_r_forward_position_controller/commands (Float64MultiArray):
-#     data: [0.3, 0.4, ..., 0.9]     # right arm target positions
+#   /follower_r_forward_position_controller/commands (ignored in AFO mode):
+#     data: [0.1, 0.2, ..., 0.8]
 #
 # Output (LeRobot dataset):
-#   observation.state     [16]  = [left_joints..., right_joints...]  (from follower)
-#   observation.velocity  [16]  = [left_joints..., right_joints...]  (from follower)
-#   observation.effort    [16]  = [left_joints..., right_joints...]  (from follower)
-#   action                [16]  = [left_joints..., right_joints...]  (from command topics)
+#   observation.state     [8]  = right_joints  (from follower)
+#   observation.velocity  [8]  = right_joint velocities, when enabled
+#   observation.effort    [8]  = right_joint efforts, when enabled
+#   action                [8]  = observation.state[t + n]
 #   observation.images.waist    = camera0 frames
 #   observation.images.chest    = camera2 frames
 #   observation.images.wrist_r  = camera1 frames
-#   observation.images.wrist_l  = camera3 frames

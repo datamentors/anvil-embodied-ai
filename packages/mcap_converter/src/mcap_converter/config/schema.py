@@ -134,13 +134,14 @@ class DataConfig:
     # leader joints parsed from robot_state_topic via joint_name_pattern.
     action_topics: Dict[str, "ActionTopicConfig"] = field(default_factory=dict)
 
-    # When True, use observation joint positions as action when action_topics
-    # are configured but the topics are not present in the MCAP file.
-    # Useful for datasets recorded without a separate command topic.
+    # When True, derive actions from future observation joint positions and
+    # ignore configured command topics, even if they are present in the MCAP.
+    # Useful for datasets recorded without a reliable command topic.
     action_from_observation: bool = False
 
-    # Number of frames to look ahead when action_from_observation=True.
-    # action[t] = observation[t + n]. Default: 10.
+    # Positive number of output frames to look ahead when
+    # action_from_observation=True. action[t] = observation[t + n]. The final
+    # n observations are omitted because they have no future target. Default: 10.
     action_from_observation_n: int = 10
 
 

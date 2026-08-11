@@ -97,18 +97,23 @@ Pick the config that matches your recording setup. `--config` is technically opt
 |--------|-------------|------|---------------|---------------|
 | `openarm_bimanual.yaml` | Leader-follower | Bimanual | Leader joint positions | 4:3 (640×480) |
 | `openarm_bimanual_quest.yaml` | Quest VR | Bimanual | Command topics | 4:3 (640×480) |
+| `openarm_bimanual_quest_afo.yaml` | Quest VR | Bimanual | Observation lookahead | 4:3 (640×480) |
 | `openarm_bimanual_quest_16x9.yaml` | Quest VR | Bimanual | Command topics | 16:9 (480×270) |
 | `openarm_single_quest.yaml` | Quest VR | Single (right) | Command topics | 4:3 (640×480) |
 | `openarm_single_quest_afo.yaml` | Quest VR | Single (right) | Observation lookahead | 4:3 (640×480) |
 
 `_16x9` variants set `image_resolution: [480, 270]`, an exact ÷4 downscale of 1920×1080 source cameras with zero letterbox padding. Use the matching `_16x9` config instead of the 4:3 default if your cameras natively output 1920×1080 — see [docs/training.md](training.md#diffusion) for details.
 
-**action_from_observation** — used by `openarm_single_quest_afo.yaml` when `/follower_*/commands` was not recorded. Instead of reading from command topics, the converter derives actions from the follower's own joint positions shifted N frames forward in time. Enable in your conversion config YAML:
+**action_from_observation** — used by the single- and bimanual `_afo.yaml` configs when `/follower_*/commands` was not recorded or should not be used. Instead of reading from command topics, the converter derives actions from the follower's own joint positions shifted N output frames forward in time. When enabled, configured command topics are ignored even if they exist in the recording. Enable it with a positive lookahead:
 
 ```yaml
 action_from_observation: true
 action_from_observation_n: 10 # action[t] = observation.state[t + n] (default n=10, ≈333ms at 30fps)
 ```
+
+The shift is applied after output-FPS subsampling, so its nominal duration is `N / fps` seconds. The final N observations in each episode are omitted because no future action target exists for them; every emitted row therefore satisfies the configured `t+N` relationship without clamping to the final state. The converter retains N pending image frames to construct these pairs, so unusually large N values increase memory use.
+
+Do not use `--resume` to append corrected AFO episodes to a dataset created by a converter version that produced same-frame actions. Reconvert every source episode into a new output directory so one dataset never mixes the old `action[t] = observation[t]` rows with corrected `t+N` rows.
 
 ```bash
 uv run mcap-convert \
