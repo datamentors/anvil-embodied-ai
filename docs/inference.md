@@ -2,6 +2,13 @@
 
 # Run Inference
 
+The checkpoint-specific, guarded two-PC deployment used for the reviewed
+envelope experiment is versioned under
+[`deploy/inference/envelope-reviewed46-ckpt000500`](../deploy/inference/envelope-reviewed46-ckpt000500/README.md).
+It keeps host paths and DDS addresses in an ignored `runtime.env`, renders the
+multicast-disabled CycloneDDS profile from a tracked template, and enforces the
+echo → shadow → explicitly confirmed live progression.
+
 All inference scenarios go through `scripts/run_inference.sh`.
 
 **Start by copying `.env.example` to `.env` and editing it for your setup:**

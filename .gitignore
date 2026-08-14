@@ -133,5 +133,12 @@ eval_results/
 # Debug artifacts (inference_node debug_image_dir dump)
 monitor_output*
 debug_images/
+
+# Host-local inference deployment state and generated DDS profiles
+deploy/inference/**/runtime.env
+deploy/inference/**/cyclonedds_two_pc_gpu.xml
+deploy/inference/**/outputs/
+deploy/inference/**/logs/
+deploy/inference/**/*.pcap
 # Git worktrees
 .worktrees/

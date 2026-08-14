@@ -1,0 +1,110 @@
+services:
+  inference:
+    image: ${IMAGE_TAG:-envelope-reviewed46-ckpt000500-shadow-safety-v2}
+    build:
+      context: ../../..
+      dockerfile: docker/inference/Dockerfile
+      args:
+        LEROBOT_VERSION: ${LEROBOT_VERSION:-0.5.1}
+        LEROBOT_EXTRAS: ${LEROBOT_EXTRAS:-pi}
+    container_name: envelope-reviewed46-ckpt000500-inference
+    network_mode: host
+    shm_size: 2gb
+    restart: "no"
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:?ROS_DOMAIN_ID is required}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+      # Let the explicitly mounted CycloneDDS profile own discovery. Avoid the
+      # ROS discovery shim replacing its unicast peer policy with SUBNET.
+      ROS_AUTOMATIC_DISCOVERY_RANGE: SYSTEM_DEFAULT
+      CYCLONEDDS_URI: file:///workspace/configs/cyclonedds/two_pc_gpu.xml
+      ECHO_TOPIC_ONLY: ${ECHO_TOPIC_ONLY:-false}
+      DEBUG: ${DEBUG:-false}
+      CAPTURE_DEBUG_IMAGES: ${CAPTURE_DEBUG_IMAGES:-false}
+      MONITOR_ENABLE: ${MONITOR_ENABLE:-false}
+      JOINT_STATE_WORKER: ${JOINT_STATE_WORKER:-false}
+      # Bound BLAS/PyTorch thread pools before Python imports any numerical
+      # libraries. The previous unconstrained runtime created hundreds of
+      # threads across the inference and camera-worker processes.
+      OMP_NUM_THREADS: ${INFERENCE_CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${INFERENCE_CPU_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${INFERENCE_CPU_THREADS:-4}
+      NUMEXPR_NUM_THREADS: ${INFERENCE_CPU_THREADS:-4}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ${MODEL_PATH:?MODEL_PATH is required}:/workspace/model:ro
+      - ${CONFIG_FILE:?CONFIG_FILE is required}:/workspace/config.yaml:ro
+      # Explicit mount: this deployment never relies on the existing repo's
+      # docker-compose.override.yml.
+      - ./cyclonedds_two_pc_gpu.xml:/workspace/configs/cyclonedds/two_pc_gpu.xml:ro
+      - ${HF_CACHE:?HF_CACHE is required}:/root/.cache/huggingface
+      - ${DEBUG_IMAGE_DIR:-./outputs/debug_images}:/workspace/debug_images
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - ros2
+      - launch
+      - lerobot_control
+      - inference.launch.py
+      - model_path:=/workspace/model
+      - config_file:=/workspace/config.yaml
+      - echo_topic_only:=${ECHO_TOPIC_ONLY:-false}
+      - debug:=${DEBUG:-false}
+      - monitor_enable:=${MONITOR_ENABLE:-false}
+      - joint_state_worker:=${JOINT_STATE_WORKER:-false}
+      - control_frequency:=${CONTROL_FREQ:-30.0}
+
+  inference-monitor:
+    image: ${IMAGE_TAG:-envelope-reviewed46-ckpt000500-shadow-safety-v2}
+    container_name: envelope-reviewed46-ckpt000500-monitor
+    network_mode: host
+    restart: "no"
+    profiles: [monitor]
+    depends_on:
+      - inference
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:?ROS_DOMAIN_ID is required}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: SYSTEM_DEFAULT
+      CYCLONEDDS_URI: file:///workspace/configs/cyclonedds/two_pc_gpu.xml
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./cyclonedds_two_pc_gpu.xml:/workspace/configs/cyclonedds/two_pc_gpu.xml:ro
+      - ${MONITOR_OUTPUT_DIR:-./outputs/monitor}:/workspace/monitor_output
+    command:
+      - ros2
+      - run
+      - lerobot_control
+      - inference_monitor_node
+      - --ros-args
+      - -p
+      - output_dir:=/workspace/monitor_output
+      - -p
+      - action_type:=absolute
+      - -p
+      - joint_names:=left_joint1,left_joint2,left_joint3,left_joint4,left_joint5,left_joint6,left_joint7,left_finger_joint1,right_joint1,right_joint2,right_joint3,right_joint4,right_joint5,right_joint6,right_joint7,right_finger_joint1
+
+  dds-check:
+    image: ${IMAGE_TAG:-envelope-reviewed46-ckpt000500-shadow-safety-v2}
+    profiles: [tools]
+    network_mode: host
+    restart: "no"
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:?ROS_DOMAIN_ID is required}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: SYSTEM_DEFAULT
+      CYCLONEDDS_URI: file:///workspace/configs/cyclonedds/two_pc_gpu.xml
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./cyclonedds_two_pc_gpu.xml:/workspace/configs/cyclonedds/two_pc_gpu.xml:ro
+      - ./check_ros_publishers.sh:/workspace/check_ros_publishers.sh:ro
+      - ./check_shadow_flow.py:/workspace/check_shadow_flow.py:ro
+      - ../../../scripts/prepare_robot_home.py:/workspace/prepare_robot_home.py:ro
+    command: [bash, /workspace/check_ros_publishers.sh, "0"]

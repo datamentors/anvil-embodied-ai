@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="@DDS_IFACE@"/>
+      </Interfaces>
+      <AllowMulticast>false</AllowMulticast>
+      <MaxMessageSize>1400B</MaxMessageSize>
+      <FragmentSize>1344B</FragmentSize>
+    </General>
+    <Discovery>
+      <Peers>
+        <!-- The self peer preserves discovery between host-network ROS processes. -->
+        <Peer address="@DDS_LOCAL_IP@"/>
+        <Peer address="@DDS_PEER_IP@"/>
+      </Peers>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <!-- The default ceiling of 9 is too small for the multi-process robot stack. -->
+      <MaxAutoParticipantIndex>31</MaxAutoParticipantIndex>
+    </Discovery>
+    <Internal>
+      <SocketReceiveBufferSize min="256MB"/>
+      <DefragUnreliableMaxSamples>64</DefragUnreliableMaxSamples>
+      <DefragReliableMaxSamples>64</DefragReliableMaxSamples>
+      <Watermarks>
+        <WhcHigh>8MB</WhcHigh>
+      </Watermarks>
+    </Internal>
+  </Domain>
+</CycloneDDS>
