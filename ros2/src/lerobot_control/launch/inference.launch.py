@@ -66,6 +66,12 @@ def generate_launch_description():
         description="Publish /monitor/obs_state, /monitor/raw_output, /monitor/control_cmd for inference_monitor_node",
     )
 
+    joint_state_worker_arg = DeclareLaunchArgument(
+        "joint_state_worker",
+        default_value="false",
+        description="Shadow-only diagnostic: receive /joint_states in a child process",
+    )
+
     # Node
     inference_node = Node(
         package="lerobot_control",
@@ -84,6 +90,7 @@ def generate_launch_description():
                 "debug": LaunchConfiguration("debug"),
                 "debug_image_dir": LaunchConfiguration("debug_image_dir"),
                 "monitor_enable": LaunchConfiguration("monitor_enable"),
+                "joint_state_worker": LaunchConfiguration("joint_state_worker"),
             }
         ],
     )
@@ -100,6 +107,7 @@ def generate_launch_description():
             debug_arg,
             debug_image_dir_arg,
             monitor_enable_arg,
+            joint_state_worker_arg,
             inference_node,
         ]
     )

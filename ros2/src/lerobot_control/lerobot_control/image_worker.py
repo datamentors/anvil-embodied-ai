@@ -7,6 +7,7 @@ contention with the main inference process.
 """
 
 import time
+from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -14,10 +15,23 @@ import numpy as np
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import CompressedImage
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.serialization import serialize_message
+from sensor_msgs.msg import CompressedImage, JointState
 
-from .shared_image_buffer import SharedImageBuffer
+from .jpeg_integrity import JpegDecodeResult, StrictJpegDecoder
+from .shared_image_buffer import SharedImageBuffer, SharedJointStateBuffer
+
+BAD_FRAME_LOG_INTERVAL_SECONDS = 5.0
+
+
+def joint_state_qos_profile() -> QoSProfile:
+    """Return the QoS contract shared by both joint-state ingress modes."""
+    return QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=10,
+    )
 
 
 class ImageWorkerNode(Node):
@@ -57,6 +71,15 @@ class ImageWorkerNode(Node):
 
         # Statistics
         self.frame_count = 0
+        self.bad_frame_count = 0
+        self.decode_error_count = 0
+        self.jpeg_warning_count = 0
+        self.invalid_jpeg_count = 0
+        self._jpeg_decoder = StrictJpegDecoder()
+        self._last_bad_frame_log_monotonic: float | None = None
+        self._bad_frames_since_log = 0
+        self._bad_reasons_since_log: Counter[str] = Counter()
+        self._last_bad_detail = ""
 
         # Subscribe to camera topic
         self.subscription = self.create_subscription(
@@ -65,15 +88,77 @@ class ImageWorkerNode(Node):
 
         self.get_logger().info(f"Image worker started: {camera_topic} -> {camera_name}")
 
+    def _emit_bad_frame_summary(self, now: float) -> None:
+        """Log accumulated JPEG rejections without flooding the ROS log."""
+        if self._bad_frames_since_log == 0:
+            return
+        reason_counts = ",".join(
+            f"{reason}={count}" for reason, count in sorted(self._bad_reasons_since_log.items())
+        )
+        detail = f" detail={self._last_bad_detail!r}" if self._last_bad_detail else ""
+        self.get_logger().warning(
+            f"Rejected JPEG frame(s) from {self.camera_name}: "
+            f"since_last_log={self._bad_frames_since_log} reasons=[{reason_counts}] "
+            f"bad_total={self.bad_frame_count} decode_errors={self.decode_error_count} "
+            f"libjpeg_warnings={self.jpeg_warning_count} "
+            f"invalid_markers={self.invalid_jpeg_count}{detail}"
+        )
+        self._last_bad_frame_log_monotonic = now
+        self._bad_frames_since_log = 0
+        self._bad_reasons_since_log.clear()
+        self._last_bad_detail = ""
+
+    def _reject_bad_frame(self, result: JpegDecodeResult) -> None:
+        """Account for a rejected JPEG and emit a rate-limited diagnostic."""
+        reason = result.rejection_reason or "unknown_jpeg_error"
+        self.bad_frame_count += 1
+        self.decode_error_count += int(result.decode_failed)
+        self.jpeg_warning_count += int(result.has_native_warning)
+        self.invalid_jpeg_count += int(result.marker_error is not None)
+        self._bad_frames_since_log += 1
+        self._bad_reasons_since_log[reason] += 1
+
+        details = []
+        if result.decode_exception:
+            details.append(result.decode_exception)
+        if result.native_stderr:
+            # Retain every captured native line in the rate-limited diagnostic;
+            # do not silently filter warning variants from libjpeg.
+            details.append(result.native_stderr)
+        self._last_bad_detail = " | ".join(details)
+
+        now = time.monotonic()
+        if (
+            self._last_bad_frame_log_monotonic is None
+            or now - self._last_bad_frame_log_monotonic >= BAD_FRAME_LOG_INTERVAL_SECONDS
+        ):
+            self._emit_bad_frame_summary(now)
+
     def _image_callback(self, msg: CompressedImage):
         """Process incoming compressed image."""
+        # Match the joint-state watchdog semantics: receipt time is when the
+        # subscription callback starts, not when JPEG decode/resize finishes.
+        # Otherwise CPU work is incorrectly reported as inter-sensor skew.
+        received_monotonic = time.monotonic()
         try:
-            # Decompress JPEG (CPU-intensive, but no GIL contention in separate process)
-            np_arr = np.frombuffer(msg.data, np.uint8)
-            image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            # Copy the serialized payload before entering native decode. Each
+            # worker is a single-threaded process, so its temporary stderr
+            # redirection is isolated from the other camera workers.
+            payload = bytes(msg.data)
+            try:
+                decode_result = self._jpeg_decoder.decode(payload)
+            except Exception as exc:  # noqa: BLE001 - fail closed on capture/decoder faults.
+                decode_result = JpegDecodeResult(
+                    image=None,
+                    decode_exception=f"{type(exc).__name__}: {exc}",
+                )
 
-            if image is None:
-                self.get_logger().warn(f"Failed to decode image from {self.camera_name}")
+            if decode_result.rejection_reason is not None:
+                self._reject_bad_frame(decode_result)
+                return
+            image = decode_result.image
+            if image is None:  # Defensive: rejection_reason covers this path.
+                self._reject_bad_frame(JpegDecodeResult(image=None))
                 return
 
             # Convert BGR to RGB
@@ -111,7 +196,12 @@ class ImageWorkerNode(Node):
             timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
             # Write to shared memory
-            self.shared_buffer.write(self.camera_name, image, timestamp)
+            self.shared_buffer.write(
+                self.camera_name,
+                image,
+                timestamp,
+                received_monotonic=received_monotonic,
+            )
 
             self.frame_count += 1
 
@@ -120,6 +210,9 @@ class ImageWorkerNode(Node):
 
     def destroy_node(self):
         """Cleanup."""
+        if self._bad_frames_since_log:
+            self._emit_bad_frame_summary(time.monotonic())
+        self._jpeg_decoder.close()
         self.shared_buffer.close()
         super().destroy_node()
 
@@ -143,6 +236,10 @@ def run_image_worker(
         buffer_name_prefix: Prefix for shared memory names
         stop_event: Optional multiprocessing.Event to signal shutdown
     """
+    # This entry point runs in a spawned child process. Limit OpenCV here,
+    # rather than at module import time, so importing image_worker from the
+    # main inference process does not alter its OpenCV thread pool.
+    cv2.setNumThreads(1)
     rclpy.init(args=[])  # Empty args to avoid inheriting parent's --ros-args node name
 
     node = ImageWorkerNode(
@@ -153,6 +250,7 @@ def run_image_worker(
         debug_dir=debug_dir,
         debug_max_frames=debug_max_frames,
     )
+    node.get_logger().info(f"OpenCV worker threads: {cv2.getNumThreads()}")
 
     executor = SingleThreadedExecutor()
     executor.add_node(node)
@@ -176,54 +274,43 @@ class JointStateWorkerNode(Node):
     """
     ROS2 node that subscribes to joint states and writes to shared memory.
 
-    Joint state processing is lightweight, but we run it in a worker for consistency.
+    The complete serialized ROS message is retained so the main process applies
+    the same parsing and validation as the legacy in-process subscription.
     """
 
     def __init__(
-        self, joint_topic: str, joint_names: list, buffer_name: str = "lerobot_joint_state"
+        self,
+        joint_topic: str,
+        buffer_name: str = "lerobot_joint_state",
+        payload_capacity: int = SharedJointStateBuffer.DEFAULT_PAYLOAD_CAPACITY,
     ):
         super().__init__("joint_state_worker")
 
-        from sensor_msgs.msg import JointState
-
-        from .shared_image_buffer import SharedJointStateBuffer
-
-        self.joint_names = joint_names
-        self.num_joints = len(joint_names)
-
         # Connect to shared memory
         self.shared_buffer = SharedJointStateBuffer(
-            num_joints=self.num_joints, create=False, buffer_name=buffer_name
+            create=False,
+            buffer_name=buffer_name,
+            payload_capacity=payload_capacity,
         )
 
-        # Subscribe to joint states
+        # Match the QoS used by the in-process subscription exactly.
         self.subscription = self.create_subscription(
-            JointState, joint_topic, self._joint_callback, 10
+            JointState,
+            joint_topic,
+            self._joint_callback,
+            joint_state_qos_profile(),
         )
 
         self.frame_count = 0
-        self.start_time = None
 
         self.get_logger().info(f"Joint state worker started: {joint_topic}")
 
-    def _joint_callback(self, msg):
-        """Process incoming joint state."""
-        if self.start_time is None:
-            self.start_time = time.time()
-
+    def _joint_callback(self, msg: JointState) -> None:
+        """Store one complete message with its callback-ingress timestamp."""
+        received_monotonic = time.monotonic()
         try:
-            # Extract positions in order
-            positions = np.zeros(self.num_joints, dtype=np.float64)
-            msg_names = list(msg.name)
-            msg_positions = list(msg.position)
-
-            for i, name in enumerate(self.joint_names):
-                if name in msg_names:
-                    idx = msg_names.index(name)
-                    positions[i] = msg_positions[idx]
-
-            timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-            self.shared_buffer.write(positions, timestamp)
+            payload = serialize_message(msg)
+            self.shared_buffer.write(payload, received_monotonic)
             self.frame_count += 1
 
         except Exception as e:
@@ -235,13 +322,18 @@ class JointStateWorkerNode(Node):
 
 
 def run_joint_state_worker(
-    joint_topic: str, joint_names: list, buffer_name: str = "lerobot_joint_state", stop_event=None
+    joint_topic: str,
+    buffer_name: str = "lerobot_joint_state",
+    payload_capacity: int = SharedJointStateBuffer.DEFAULT_PAYLOAD_CAPACITY,
+    stop_event=None,
 ):
     """Entry point for joint state worker process."""
     rclpy.init(args=[])  # Empty args to avoid inheriting parent's --ros-args node name
 
     node = JointStateWorkerNode(
-        joint_topic=joint_topic, joint_names=joint_names, buffer_name=buffer_name
+        joint_topic=joint_topic,
+        buffer_name=buffer_name,
+        payload_capacity=payload_capacity,
     )
 
     executor = SingleThreadedExecutor()

@@ -14,6 +14,7 @@ model:
   # VLA task prompt — required for SmolVLA / Pi0 / Pi0.5, ignored for ACT / Diffusion
   # Set to the task the model was trained/finetuned for.
   task_description: null
+  require_checkpoint_manifest: true
 
 # -----------------------------------------------------------------------------
 # Inference Tuning (per model type)
@@ -53,6 +54,13 @@ inference_tuning:
     execution_horizon: 12
     max_guidance_weight: 10.0
     prefix_attention_schedule: EXP
+    # Fail-closed RTC readiness proof. Keep these values aligned with the
+    # real-robot config; publication stays closed while any bound is missed.
+    readiness_guided_forwards: 5
+    readiness_latency_guard_steps: 2
+    readiness_index_phase_tolerance_steps: 1
+    readiness_scheduler_guard_steps: 1
+    readiness_min_guided_overlap_steps: 3
 
 # -----------------------------------------------------------------------------
 # Joint Configuration
@@ -141,7 +149,31 @@ cameras:
 #   Use to overcome motor friction when model delta outputs are too small to move joints.
 #   Commands are held at last published value until cumulative change exceeds this threshold.
 #   Default: disabled (null). Recommended starting value: 0.05.
-# Uncomment to override defaults:
-# safety:
-#   max_position_delta: 0.1
-#   min_position_delta: 0.05
+safety:
+  max_position_delta: 0.1
+  min_position_delta: null
+  joint_limit_tolerance: 0.000001
+  joint_position_limits:
+    follower_l_finger_joint1: [0.0, 0.05]
+    follower_l_joint1: [-2.3562, 2.3562]
+    follower_l_joint2: [-3.3161, 0.1745]
+    follower_l_joint3: [-1.570796, 1.570796]
+    follower_l_joint4: [0.0, 2.443461]
+    follower_l_joint5: [-1.570796, 1.570796]
+    follower_l_joint6: [-0.785398, 0.785398]
+    follower_l_joint7: [-1.570796, 1.570796]
+    follower_r_finger_joint1: [0.0, 0.05]
+    follower_r_joint1: [-2.3562, 2.3562]
+    follower_r_joint2: [-0.1745, 3.3161]
+    follower_r_joint3: [-1.570796, 1.570796]
+    follower_r_joint4: [0.0, 2.443461]
+    follower_r_joint5: [-1.570796, 1.570796]
+    follower_r_joint6: [-0.785398, 0.785398]
+    follower_r_joint7: [-1.570796, 1.570796]
+
+watchdog:
+  camera_timeout_sec: 0.25
+  joint_state_timeout_sec: 0.10
+  max_sensor_skew_sec: 0.10
+  max_action_age_sec: 1.50
+  startup_grace_sec: 10.0

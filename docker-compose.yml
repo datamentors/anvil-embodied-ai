@@ -18,6 +18,13 @@ services:
       - ECHO_TOPIC_ONLY=${ECHO_TOPIC_ONLY:-false}
       - DEBUG=${DEBUG:-false}
       - MONITOR_ENABLE=${MONITOR_ENABLE:-false}
+      # Bound native math-library pools. Unbounded defaults are inherited by
+      # the inference process and spawned camera workers and can oversubscribe
+      # the host heavily enough to starve CUDA kernel launches.
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-4}
+      - OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-4}
+      - NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-4}
       - DISPLAY=${DISPLAY}
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
