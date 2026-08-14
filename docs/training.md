@@ -129,9 +129,14 @@ Additional delta flags:
 
 **Guidance by policy:**
 - **Diffusion** → `ACTION: MIN_MAX`. Diffusion clips denoised actions to ±1 at every step (`clip_sample=True`); `MEAN_STD` silently truncates extreme actions.
-- **ACT / SmolVLA / Pi0 / Pi0.5** → `ACTION: MEAN_STD`
+- **ACT / SmolVLA / Pi0** → `ACTION: MEAN_STD`
+- **Pi0.5** → default quantile normalization when the dataset has been prepared
+  with `scripts/prepare_trainready_dataset.py`; `MEAN_STD` is the fallback for
+  datasets without exact quantile statistics.
 
-> **Pi0.5 note:** Pi0.5's default normalization is `QUANTILE10`, which requires `q01`/`q99` fields in `stats.json`. Datasets converted with `mcap-convert` do not include these. Use `MEAN_STD` instead (recommended), or see [Pi0.5](#pi05) for the quantile augmentation option.
+> **Pi0.5 note:** Pi0.5's default normalization requires exact `q01`/`q99`
+> fields. Do not average per-episode quantiles or modify the converted dataset
+> in place. See [Pi0.5](#pi05) for the isolated train-ready workflow.
 
 ---
 
@@ -459,24 +464,46 @@ uv run anvil-trainer \
 
 **Normalization:**
 
-Pi0.5's default normalization is `QUANTILE10`, which requires `q01`/`q99` stats not produced by `mcap-convert`. Two options:
+Pi0.5's default normalization requires `q01`/`q99` stats not produced by
+`mcap-convert`. Two options:
 
-**Option A — Override (recommended for Anvil datasets)**
+**Option A — Prepare an isolated train-ready copy (recommended)**
 
-Pass `MEAN_STD` for actions and states, which uses the existing mean/std stats. This is the approach shown in the command above.
+Run the preparation utility with the same LeRobot 0.5.1 environment used for
+training. It copies the source dataset, recomputes global and per-episode
+statistics from every Parquet row and decoded RGB frame, validates Pi0.5's
+quantile normalization and local loader, and publishes the result atomically.
+The source dataset is never modified.
 
-**Option B — Augment the dataset with quantile stats**
+For an absolute-action dataset whose converter used a 10-frame
+action-from-observation lookahead:
 
 ```bash
-uv run python -c "
-from lerobot.datasets.v30.augment_dataset_quantile_stats import main
-main()
-" -- --repo-id=local/your-dataset
+.venv/bin/python scripts/prepare_trainready_dataset.py \
+  /absolute/path/to/reviewed-dataset \
+  --action-type=absolute \
+  --afo-lookahead-frames=10
 ```
 
-> **Warning:** this modifies the dataset in-place. Back up first: `cp -r data/datasets/my-dataset data/datasets/my-dataset.bak`
+The default output is a sibling named `SOURCE-trainready`. To revalidate an
+existing result without writing anything:
 
-After augmentation you can omit `--policy.normalization_mapping` and use the default `QUANTILE10`.
+```bash
+.venv/bin/python scripts/prepare_trainready_dataset.py \
+  /absolute/path/to/reviewed-dataset-trainready \
+  --validate-only
+```
+
+The generated `TRAIN_READY.json` records dataset hashes, decoded camera counts,
+action representation, AFO lookahead, task prompts and the Pi0.5 action chunk
+size. After preparation, omit `--policy.normalization_mapping` and use Pi0.5's
+default quantile normalization.
+
+**Option B — Override normalization**
+
+For datasets that cannot be prepared yet, pass `MEAN_STD` for actions and
+states as shown in the command above. This uses the existing converter stats
+but does not exercise Pi0.5's default quantile contract.
 
 #### Four-GPU large-dataset launcher
 
