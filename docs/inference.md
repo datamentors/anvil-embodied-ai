@@ -2,13 +2,6 @@
 
 # Run Inference
 
-The checkpoint-specific, guarded two-PC deployment used for the reviewed
-envelope experiment is versioned under
-[`deploy/inference/envelope-reviewed46-ckpt000500`](../deploy/inference/envelope-reviewed46-ckpt000500/README.md).
-It keeps host paths and DDS addresses in an ignored `runtime.env`, renders the
-multicast-disabled CycloneDDS profile from a tracked template, and enforces the
-echo → shadow → explicitly confirmed live progression.
-
 All inference scenarios go through `scripts/run_inference.sh`.
 
 **Start by copying `.env.example` to `.env` and editing it for your setup:**
@@ -170,12 +163,6 @@ safety:
   # Hard limit on joint position change per control step (radians).
   min_position_delta: null
   joint_limit_tolerance: 0.000001
-  allow_live_joint_limit_saturation: false
-  saturate_all_raw_targets_to_joint_limits: false
-  joint_limit_saturation_margins:
-    # Accepted model-space overshoot is clipped to the hard bound before delta
-    # limiting; commands never use the margin as an expanded hardware limit.
-    follower_l_finger_joint1: [0.003, 0.003]
   joint_position_limits:
     # Required full mapping keyed by exact ROS joint names. See the default
     # config for all 16 values sourced from the deployed robot URDF.
@@ -188,21 +175,10 @@ delta limiter can hide an invalid raw target, and once more on the final
 command. The node prepares and validates both arms before publishing either
 one, so a bad target on the right arm cannot leave a left-only command behind.
 Missing, extra, inverted, or non-finite limit entries abort startup.
-Finger saturation margins are capped at 0.003 metres per side by default. A
-debug-only profile, or a live profile with the explicit
-`allow_live_joint_limit_saturation: true` opt-in, may raise that cap to 0.01
-metres and declare explicit revolute margins up to 0.12 radians per side.
-Values outside an explicit model-space margin still fail closed.
-Every accepted target is clipped to the hard URDF bound before delta limiting;
-saturation warnings are rate-limited and include a per-joint count. Keep live
-profiles free of revolute margins until the shadow distribution has been
-reviewed; any live exception should list only reviewed joints and sides.
-
-For a short operator-attended diagnostic,
-`saturate_all_raw_targets_to_joint_limits: true` together with
-`allow_live_joint_limit_saturation: true` clips arbitrary raw-model overshoot
-to the configured hard limits before delta limiting. It never expands the
-published range and does not disable final-command validation.
+Targets outside the configured limit plus the numerical tolerance always fail
+closed. The runtime does not provide a diagnostic mode that clips arbitrary
+model targets into range; correcting the policy or its normalization cannot be
+replaced by a permissive deployment setting.
 
 **Fail-closed input watchdog:**
 ```yaml

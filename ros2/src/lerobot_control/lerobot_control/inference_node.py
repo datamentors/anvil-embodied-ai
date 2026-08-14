@@ -333,34 +333,6 @@ class LeRobotInferenceNode(Node):
             safety_config.get("joint_limit_tolerance", 1e-6)
         )
         raw_joint_position_limits = safety_config.get("joint_position_limits", {})
-        raw_joint_saturation_margins = safety_config.get(
-            "joint_limit_saturation_margins", {}
-        )
-        self._allow_live_joint_limit_saturation = safety_config.get(
-            "allow_live_joint_limit_saturation", False
-        )
-        if not isinstance(self._allow_live_joint_limit_saturation, bool):
-            raise ValueError(
-                "safety.allow_live_joint_limit_saturation must be a boolean"
-            )
-        self._saturate_all_raw_targets_to_joint_limits = safety_config.get(
-            "saturate_all_raw_targets_to_joint_limits", False
-        )
-        if not isinstance(
-            self._saturate_all_raw_targets_to_joint_limits,
-            bool,
-        ):
-            raise ValueError(
-                "safety.saturate_all_raw_targets_to_joint_limits must be a boolean"
-            )
-        if (
-            self._saturate_all_raw_targets_to_joint_limits
-            and not self._allow_live_joint_limit_saturation
-        ):
-            raise ValueError(
-                "safety.saturate_all_raw_targets_to_joint_limits requires "
-                "safety.allow_live_joint_limit_saturation=true"
-            )
 
         watchdog_config = self.config.get("watchdog", {})
         self._watchdog_camera_timeout_sec = float(
@@ -432,17 +404,8 @@ class LeRobotInferenceNode(Node):
             self._joint_position_limits = self._parse_joint_position_limits(
                 raw_joint_position_limits
             )
-            self._joint_limit_saturation_margins = (
-                self._parse_joint_limit_saturation_margins(
-                    raw_joint_saturation_margins
-                )
-            )
         else:
             self._joint_position_limits = {}
-            self._joint_limit_saturation_margins = {}
-        self._joint_limit_saturation_counts: dict[str, int] = {}
-        self._joint_limit_saturation_last_log: dict[str, float] = {}
-        self._joint_limit_saturation_max_overshoot: dict[str, float] = {}
 
         # Inference tuning — per model type (resolved after model_type is known)
         self._tuning_config = self.config.get("inference_tuning", {})
@@ -562,84 +525,6 @@ class LeRobotInferenceNode(Node):
                     f"invalid joint limit for {name}: lower={lower}, upper={upper}"
                 )
             parsed[name] = (lower, upper)
-        return parsed
-
-    def _parse_joint_limit_saturation_margins(
-        self,
-        raw_margins: dict,
-    ) -> dict[str, tuple[float, float]]:
-        """Validate explicit per-side margins for saturating model targets.
-
-        Saturation never expands the command sent to hardware: accepted values
-        are clipped back to the hard URDF bound before delta limiting. The
-        margin only describes how far a model-space target may lie outside that
-        bound before the runtime fails closed. Revolute-joint margins require
-        either debug-only command endpoints or the explicit live saturation
-        opt-in. Neither mode expands the hard command bounds.
-        """
-        if raw_margins is None:
-            return {}
-        if not isinstance(raw_margins, dict):
-            raise ValueError("safety.joint_limit_saturation_margins must be a mapping")
-
-        unknown = sorted(set(raw_margins) - set(self._joint_position_limits))
-        if unknown:
-            raise ValueError(
-                "joint saturation margins reference unknown joints: "
-                + ", ".join(unknown)
-            )
-
-        command_topics = [
-            arm.get("command_topic")
-            for arm in self.arms_config.values()
-            if isinstance(arm, dict)
-        ]
-        debug_only_commands = bool(command_topics) and all(
-            isinstance(topic, str) and topic.startswith("/debug/")
-            for topic in command_topics
-        )
-        live_saturation_enabled = getattr(
-            self, "_allow_live_joint_limit_saturation", False
-        )
-
-        parsed: dict[str, tuple[float, float]] = {}
-        for name, raw_bounds in raw_margins.items():
-            is_finger = name.endswith("_finger_joint1")
-            if not is_finger and not (
-                debug_only_commands or live_saturation_enabled
-            ):
-                raise ValueError(
-                    "revolute joint saturation margins require every command "
-                    "topic under /debug/ or "
-                    "safety.allow_live_joint_limit_saturation=true: "
-                    f"{name}"
-                )
-            if not isinstance(raw_bounds, (list, tuple)) or len(raw_bounds) != 2:
-                raise ValueError(
-                    f"joint saturation margin for {name} must be [lower, upper]"
-                )
-            lower_margin, upper_margin = map(float, raw_bounds)
-            diagnostic_or_live_opt_in = (
-                debug_only_commands or live_saturation_enabled
-            )
-            maximum = (
-                0.01 if diagnostic_or_live_opt_in else 0.003
-            ) if is_finger else 0.12
-            if (
-                not math.isfinite(lower_margin)
-                or not math.isfinite(upper_margin)
-                or lower_margin < 0
-                or upper_margin < 0
-                or lower_margin > maximum
-                or upper_margin > maximum
-                or (lower_margin == 0 and upper_margin == 0)
-            ):
-                raise ValueError(
-                    f"invalid joint saturation margin for {name}: "
-                    f"lower={lower_margin}, upper={upper_margin}; "
-                    f"each side must be within [0, {maximum}] and one must be non-zero"
-                )
-            parsed[name] = (lower_margin, upper_margin)
         return parsed
 
     def _read_checkpoint_metadata(self) -> dict:
@@ -2618,7 +2503,7 @@ class LeRobotInferenceNode(Node):
             # be hidden by a small per-cycle clamp and walk the robot toward the
             # invalid target over repeated cycles.
             raw_controller_action = self.action_limiter.reorder(model_order_action)
-            raw_controller_action = self._sanitize_absolute_joint_targets(
+            raw_controller_action = self._validate_absolute_joint_targets(
                 current_names,
                 raw_controller_action,
                 stage="raw absolute",
@@ -2630,12 +2515,7 @@ class LeRobotInferenceNode(Node):
             )
             if not np.all(np.isfinite(arm_action)):
                 raise ValueError(f"processed action is non-finite for arm {arm_name}")
-            arm_action = self._sanitize_absolute_joint_targets(
-                current_names,
-                arm_action,
-                stage="final command",
-            )
-            self._validate_absolute_joint_targets(
+            arm_action = self._validate_absolute_joint_targets(
                 current_names,
                 arm_action,
                 stage="final command",
@@ -2674,22 +2554,14 @@ class LeRobotInferenceNode(Node):
         self.metrics.record_action_output()
         self._has_published = True
 
-    def _sanitize_absolute_joint_targets(
+    def _validate_absolute_joint_targets(
         self,
         joint_names: list[str],
         targets: np.ndarray,
         *,
         stage: str,
     ) -> np.ndarray:
-        """Clip explicitly approved model-space overshoot to hard URDF bounds.
-
-        Every target without an explicit margin remains fail-closed unless the
-        explicit diagnostic raw-target saturation mode is enabled. That mode
-        applies only to the raw model output; final commands are still checked
-        against the complete hard-limit map. The numerical limit tolerance is
-        also clipped, so no command intentionally leaves this function outside
-        the configured hard bound.
-        """
+        """Reject out-of-range targets and clip numerical tolerance to the bound."""
         targets = np.asarray(targets, dtype=np.float64).reshape(-1).copy()
         if len(targets) != len(joint_names):
             raise ValueError(
@@ -2699,102 +2571,9 @@ class LeRobotInferenceNode(Node):
         if not np.all(np.isfinite(targets)):
             raise ValueError(f"{stage} joint target is non-finite")
 
-        margins = getattr(self, "_joint_limit_saturation_margins", {})
-        saturate_all_raw = (
-            stage == "raw absolute"
-            and getattr(
-                self,
-                "_saturate_all_raw_targets_to_joint_limits",
-                False,
-            )
-        )
-        clipped: list[tuple[str, float, float]] = []
         for index, (joint_name, target) in enumerate(
             zip(joint_names, targets, strict=True)
         ):
-            lower, upper = self._joint_position_limits[joint_name]
-            lower_margin, upper_margin = margins.get(joint_name, (0.0, 0.0))
-            accepted_lower = lower - max(
-                self._joint_limit_tolerance,
-                lower_margin,
-            )
-            accepted_upper = upper + max(
-                self._joint_limit_tolerance,
-                upper_margin,
-            )
-            if (
-                target < accepted_lower or target > accepted_upper
-            ) and not saturate_all_raw:
-                raise ValueError(
-                    f"{stage} joint target outside absolute limit: "
-                    f"{joint_name}={target:.9f}, "
-                    f"allowed=[{lower:.9f}, {upper:.9f}]"
-                )
-            bounded = float(np.clip(target, lower, upper))
-            if bounded != target:
-                targets[index] = bounded
-                clipped.append((joint_name, float(target), bounded))
-
-        if clipped:
-            self._record_joint_limit_saturation(stage, clipped)
-        return targets
-
-    def _record_joint_limit_saturation(
-        self,
-        stage: str,
-        clipped: list[tuple[str, float, float]],
-    ) -> None:
-        """Rate-limit warnings while retaining totals and maximum overshoot."""
-        counts = getattr(self, "_joint_limit_saturation_counts", None)
-        if counts is None:
-            counts = self._joint_limit_saturation_counts = {}
-        last_log = getattr(self, "_joint_limit_saturation_last_log", None)
-        if last_log is None:
-            last_log = self._joint_limit_saturation_last_log = {}
-        max_overshoot = getattr(
-            self,
-            "_joint_limit_saturation_max_overshoot",
-            None,
-        )
-        if max_overshoot is None:
-            max_overshoot = self._joint_limit_saturation_max_overshoot = {}
-
-        now = time.monotonic()
-        for joint_name, original, bounded in clipped:
-            counts[joint_name] = counts.get(joint_name, 0) + 1
-            overshoot = abs(original - bounded)
-            max_overshoot[joint_name] = max(
-                max_overshoot.get(joint_name, 0.0),
-                overshoot,
-            )
-            if now - last_log.get(joint_name, float("-inf")) < 5.0:
-                continue
-            self.get_logger().warning(
-                f"Saturated {stage} target to URDF bound: "
-                f"{joint_name}={original:.9f} -> {bounded:.9f} "
-                f"total={counts[joint_name]} "
-                f"max_overshoot={max_overshoot[joint_name]:.9f}"
-            )
-            last_log[joint_name] = now
-
-    def _validate_absolute_joint_targets(
-        self,
-        joint_names: list[str],
-        targets: np.ndarray,
-        *,
-        stage: str,
-    ) -> None:
-        """Reject absolute joint targets outside configured URDF limits."""
-        targets = np.asarray(targets, dtype=np.float64).reshape(-1)
-        if len(targets) != len(joint_names):
-            raise ValueError(
-                f"{stage} target dimension mismatch: "
-                f"got {len(targets)}, expected {len(joint_names)}"
-            )
-        if not np.all(np.isfinite(targets)):
-            raise ValueError(f"{stage} joint target is non-finite")
-
-        for joint_name, target in zip(joint_names, targets, strict=True):
             lower, upper = self._joint_position_limits[joint_name]
             if (
                 target < lower - self._joint_limit_tolerance
@@ -2805,6 +2584,8 @@ class LeRobotInferenceNode(Node):
                     f"{joint_name}={target:.9f}, "
                     f"allowed=[{lower:.9f}, {upper:.9f}]"
                 )
+            targets[index] = float(np.clip(target, lower, upper))
+        return targets
 
     def _publish_monitor(
         self,

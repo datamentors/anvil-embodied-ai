@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 usage() {
   cat <<'EOF'
 Usage:
   DATASET_ROOT=/absolute/path/to/trainready-dataset \
-    scripts/run_pi05_1000plus.sh {full_vlm|expert_only}
+  HF_CACHE=/absolute/path/to/huggingface-cache \
+    scripts/run_pi05_multigpu.sh {full_vlm|expert_only}
 
 Optional environment variables:
+  TASK_DESCRIPTION=<override unique prompt from TRAIN_READY.json>
+  ANVIL_TRAIN_SOURCE=<repo root; defaults to this checkout>
+  VENV=<venv path; defaults to $ANVIL_TRAIN_SOURCE/.venv>
+  RUN_ROOT=<output root; defaults to $ANVIL_TRAIN_SOURCE/runs/pi05>
+  CUDA_DEVICES=0,1,2,3
+  BATCH_PER_GPU=16
   EPOCHS=5
-  TASK_DESCRIPTION="Pick up the envelope and place it in the target area"
-  ANVIL_TRAIN_SOURCE=/path/to/frozen/training/source
-  RUN_ROOT=/path/to/output/root
   PROBE_FULL_VLM=1
   PREFLIGHT_ONLY=0
   SMOKE_TEST=0
@@ -34,13 +41,13 @@ fi
 case "${MODE}" in
   full_vlm)
     TRAIN_EXPERT_ONLY=false
-    LEARNING_RATE=1e-5
-    MAIN_PORT=29631
+    LEARNING_RATE="${FULL_VLM_LR:-1e-5}"
+    DEFAULT_MAIN_PORT=29631
     ;;
   expert_only)
     TRAIN_EXPERT_ONLY=true
-    LEARNING_RATE=3e-5
-    MAIN_PORT=29632
+    LEARNING_RATE="${EXPERT_ONLY_LR:-3e-5}"
+    DEFAULT_MAIN_PORT=29632
     ;;
   *)
     echo "Unknown mode: ${MODE}" >&2
@@ -49,19 +56,32 @@ case "${MODE}" in
     ;;
 esac
 
-SOURCE="${ANVIL_TRAIN_SOURCE:-/home/datamentors/experiments/envelope-afo30-s04-55-20260811/training/source}"
-VENV="${VENV:-/home/datamentors/experiments/envelope-afo30-s04-55-20260811/training/.venv}"
-HF_CACHE="${HF_CACHE:-/data/work/hf-cache}"
-RUN_ROOT="${RUN_ROOT:-/home/datamentors/experiments/envelope-pi05-1000plus/training}"
-TASK="${TASK_DESCRIPTION:-Pick up the envelope and place it in the target area}"
+SOURCE="${ANVIL_TRAIN_SOURCE:-${REPO_ROOT}}"
+VENV="${VENV:-${SOURCE}/.venv}"
+: "${HF_CACHE:?HF_CACHE must point to the offline Hugging Face cache}"
+RUN_ROOT="${RUN_ROOT:-${SOURCE}/runs/pi05}"
+CUDA_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
+MAIN_PORT="${MAIN_PORT:-${DEFAULT_MAIN_PORT}}"
 
 EPOCHS="${EPOCHS:-5}"
-BATCH_PER_GPU=16
-WORLD_SIZE=4
-GLOBAL_BATCH_SIZE=64
-SEED=1000
-LOG_FREQ=500
+BATCH_PER_GPU="${BATCH_PER_GPU:-16}"
+IFS=',' read -r -a GPU_IDS <<<"${CUDA_DEVICES}"
+WORLD_SIZE="${#GPU_IDS[@]}"
+SEED="${SEED:-1000}"
+LOG_FREQ="${LOG_FREQ:-500}"
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+
+if ((WORLD_SIZE < 1)) || ! [[ "${BATCH_PER_GPU}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: CUDA_DEVICES and BATCH_PER_GPU must select a non-empty valid batch" >&2
+  exit 2
+fi
+for gpu_id in "${GPU_IDS[@]}"; do
+  if ! [[ "${gpu_id}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: invalid CUDA device ID: ${gpu_id@Q}" >&2
+    exit 2
+  fi
+done
+GLOBAL_BATCH_SIZE="$((BATCH_PER_GPU * WORLD_SIZE))"
 
 test -d "${DATASET_ROOT}"
 test -f "${DATASET_ROOT}/meta/info.json"
@@ -70,8 +90,9 @@ test -f "${DATASET_ROOT}/TRAIN_READY.json"
 test -x "${VENV}/bin/accelerate"
 test -x "${VENV}/bin/anvil-trainer"
 test -f "${SOURCE}/scripts/_ddp_shim/sitecustomize.py"
+test -d "${HF_CACHE}"
 
-export CUDA_VISIBLE_DEVICES="0,1,2,3"
+export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
 export HF_HOME="${HF_CACHE}"
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
@@ -99,9 +120,12 @@ mkdir -p \
 
 # Reproduce the trainer's deterministic 8:1:1 episode split and derive the
 # number of optimizer steps from the actual train frames and global batch.
-eval "$("${VENV}/bin/python" - "${DATASET_ROOT}" "${EPOCHS}" <<'PY'
+if ! metadata_exports="$("${VENV}/bin/python" - \
+  "${DATASET_ROOT}" "${EPOCHS}" "${GLOBAL_BATCH_SIZE}" "${SEED}" <<'PY'
+import json
 import math
 import random
+import shlex
 import sys
 from pathlib import Path
 
@@ -109,6 +133,15 @@ import pyarrow.dataset as pads
 
 root = Path(sys.argv[1])
 epochs = int(sys.argv[2])
+global_batch_size = int(sys.argv[3])
+seed = int(sys.argv[4])
+marker = json.loads((root / "TRAIN_READY.json").read_text())
+facts = marker["facts"]
+if facts["action_type"] != "absolute":
+    raise RuntimeError("This Pi0.5 recipe requires absolute actions")
+lookahead = int(facts["afo_lookahead_frames"])
+prompts = facts.get("task_prompts", [])
+dataset_task = prompts[0] if len(prompts) == 1 else ""
 table = pads.dataset(root / "meta" / "episodes", format="parquet").to_table(
     columns=["episode_index", "length"]
 )
@@ -125,14 +158,14 @@ if episode_ids != list(range(len(episode_ids))):
     raise RuntimeError("episode_index must be contiguous from 0 to N-1")
 
 shuffled = episode_ids.copy()
-random.Random(1000).shuffle(shuffled)
+random.Random(seed).shuffle(shuffled)
 total_episodes = len(shuffled)
 n_test = round(total_episodes * 0.1)
 n_val = round(total_episodes * 0.1)
 n_train = total_episodes - n_val - n_test
 train_episodes = sorted(shuffled[:n_train])
 train_frames = sum(lengths[episode] for episode in train_episodes)
-steps_per_epoch = math.ceil(train_frames / 64)
+steps_per_epoch = math.ceil(train_frames / global_batch_size)
 steps = steps_per_epoch * epochs
 # Keep two resumable checkpoints (midpoint and final). Full-VLM Adam state is
 # substantially larger than expert-only state, so per-epoch saves can exhaust
@@ -149,8 +182,20 @@ print(f"STEPS_PER_EPOCH={steps_per_epoch}")
 print(f"STEPS={steps}")
 print(f"SAVE_FREQ={save_freq}")
 print(f"WARMUP_STEPS={warmup_steps}")
+print(f"AFO_LOOKAHEAD_FRAMES={lookahead}")
+print(f"DATASET_TASK={shlex.quote(dataset_task)}")
 PY
-)"
+)"; then
+  echo "ERROR: could not read the train-ready dataset contract" >&2
+  exit 1
+fi
+eval "${metadata_exports}"
+
+TASK="${TASK_DESCRIPTION:-${DATASET_TASK}}"
+if [[ -z "${TASK}" ]]; then
+  echo "ERROR: TRAIN_READY.json does not contain one unique prompt; set TASK_DESCRIPTION" >&2
+  exit 2
+fi
 
 export PYTHONPATH="${SOURCE}/scripts/_ddp_shim:${SOURCE}/packages/anvil_trainer/src:${SOURCE}/packages/anvil_shared/src${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -159,6 +204,8 @@ printf '%s\n' \
   "Dataset: ${DATASET_ROOT}" \
   "Episodes: total=${TOTAL_EPISODES}, train=${TRAIN_EPISODES}, val=${VAL_EPISODES}, test=${TEST_EPISODES}" \
   "Train frames: ${TRAIN_FRAMES}" \
+  "Task: ${TASK}" \
+  "AFO lookahead: ${AFO_LOOKAHEAD_FRAMES} frames" \
   "Epochs: ${EPOCHS}" \
   "Steps: ${STEPS_PER_EPOCH}/epoch, ${STEPS} total" \
   "Batch: ${BATCH_PER_GPU}/GPU x ${WORLD_SIZE} = ${GLOBAL_BATCH_SIZE}" \
@@ -205,7 +252,9 @@ run_training() {
     run_log_freq=4
   fi
 
-  local job_name="pi05_1000plus_${kind}_4gpu_bs16_${RUN_TS}"
+  local dataset_name job_name
+  dataset_name="$(printf '%s' "$(basename "${DATASET_ROOT}")" | tr -cs 'A-Za-z0-9_.-' '-')"
+  job_name="pi05_${dataset_name}_${kind}_${WORLD_SIZE}gpu_bs${BATCH_PER_GPU}_${RUN_TS}"
   local run_dir="${RUN_ROOT}/runs/${job_name}"
   local output_dir="${run_dir}/output"
   local log_file="${RUN_ROOT}/logs/${job_name}.log"
@@ -229,7 +278,7 @@ run_training() {
 
   cd "${SOURCE}"
   "${VENV}/bin/accelerate" launch \
-    --num_processes=4 \
+    --num_processes="${WORLD_SIZE}" \
     --num_machines=1 \
     --mixed_precision=bf16 \
     --dynamo_backend=no \
@@ -268,7 +317,7 @@ run_training() {
     --resume=false \
     --wandb.enable="${wandb_enable}" \
     --wandb.mode=offline \
-    --note="pi05_base; ${kind}; ${TOTAL_EPISODES} episodes; AFO N10 at 30Hz; absolute actions; 4 GPUs; batch 16/rank global 64; lr ${LEARNING_RATE}" \
+    --note="pi05_base; ${kind}; ${TOTAL_EPISODES} episodes; AFO N${AFO_LOOKAHEAD_FRAMES}; absolute actions; ${WORLD_SIZE} GPUs; batch ${BATCH_PER_GPU}/rank global ${GLOBAL_BATCH_SIZE}; lr ${LEARNING_RATE}" \
     2>&1 | tee "${log_file}"
 
   printf 'completed_utc=%s\n' "$(date -u +%FT%TZ)" >> "${run_dir}/RUN_CONFIG.txt"
@@ -289,7 +338,7 @@ fi
 
 if [[ "${MODE}" == "full_vlm" && "${PROBE_FULL_VLM:-1}" == "1" ]]; then
   echo "Running the mandatory 20-step full-VLM memory probe."
-  run_training full_vlm_probe 20 20 false false 29630
+  run_training full_vlm_probe 20 20 false false "${PROBE_PORT:-29630}"
   assert_gpus_idle
 fi
 

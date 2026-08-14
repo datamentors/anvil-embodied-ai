@@ -171,7 +171,7 @@ class ActionLimiter:
         del joint_order, ref_state  # Backward-compatible, intentionally unused.
         # Reorder from model order to controller order, then use the same
         # controller-order path exposed to callers that must validate or
-        # saturate absolute targets before delta limiting.
+        # otherwise inspect absolute targets before delta limiting.
         action = self.reorder(action.copy())
         return self.process_controller_order(action, current_positions)
 

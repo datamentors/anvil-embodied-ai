@@ -505,35 +505,38 @@ For datasets that cannot be prepared yet, pass `MEAN_STD` for actions and
 states as shown in the command above. This uses the existing converter stats
 but does not exercise Pi0.5's default quantile contract.
 
-#### Four-GPU large-dataset launcher
+#### Multi-GPU Pi0.5 launcher
 
-`scripts/run_pi05_1000plus.sh` provides the reviewed 4-GPU recipe for a
-train-ready local dataset. It requires `TRAIN_READY.json`, derives the number
-of optimizer steps from the deterministic 8:1:1 episode split, uses batch 16
-per GPU (global batch 64), and starts from `lerobot/pi05_base` with absolute
-actions and exact quantile normalization. It refuses to start when another GPU
-process is present or there is insufficient checkpoint space.
+`scripts/run_pi05_multigpu.sh` provides the reviewed recipe for a train-ready
+local dataset. It requires `TRAIN_READY.json`, reads the AFO contract and unique
+task prompt from that marker, derives optimizer steps from the deterministic
+8:1:1 episode split, and starts from `lerobot/pi05_base` with absolute actions
+and exact quantile normalization. It defaults to four GPUs and batch 16 per
+GPU, but both are explicit environment settings. It refuses to start when
+another GPU process is present or there is insufficient checkpoint space.
 
 Run its non-mutating preflight first:
 
 ```bash
 DATASET_ROOT=/absolute/path/to/trainready-dataset \
+HF_CACHE=/absolute/path/to/huggingface-cache \
 PREFLIGHT_ONLY=1 \
-scripts/run_pi05_1000plus.sh full_vlm
+scripts/run_pi05_multigpu.sh full_vlm
 ```
 
 Then start the full-VLM fine-tune:
 
 ```bash
 DATASET_ROOT=/absolute/path/to/trainready-dataset \
-scripts/run_pi05_1000plus.sh full_vlm
+HF_CACHE=/absolute/path/to/huggingface-cache \
+scripts/run_pi05_multigpu.sh full_vlm
 ```
 
 Use `expert_only` instead of `full_vlm` for the lower-memory action-expert
 comparison. The full-VLM mode performs a mandatory 20-step memory probe before
 the real run. `EPOCHS` defaults to 5; paths, task description, output root and
 offline Hugging Face cache can be overridden through the environment variables
-listed by `scripts/run_pi05_1000plus.sh --help`.
+listed by `scripts/run_pi05_multigpu.sh --help`.
 
 ---
 
