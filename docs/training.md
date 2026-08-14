@@ -478,6 +478,36 @@ main()
 
 After augmentation you can omit `--policy.normalization_mapping` and use the default `QUANTILE10`.
 
+#### Four-GPU large-dataset launcher
+
+`scripts/run_pi05_1000plus.sh` provides the reviewed 4-GPU recipe for a
+train-ready local dataset. It requires `TRAIN_READY.json`, derives the number
+of optimizer steps from the deterministic 8:1:1 episode split, uses batch 16
+per GPU (global batch 64), and starts from `lerobot/pi05_base` with absolute
+actions and exact quantile normalization. It refuses to start when another GPU
+process is present or there is insufficient checkpoint space.
+
+Run its non-mutating preflight first:
+
+```bash
+DATASET_ROOT=/absolute/path/to/trainready-dataset \
+PREFLIGHT_ONLY=1 \
+scripts/run_pi05_1000plus.sh full_vlm
+```
+
+Then start the full-VLM fine-tune:
+
+```bash
+DATASET_ROOT=/absolute/path/to/trainready-dataset \
+scripts/run_pi05_1000plus.sh full_vlm
+```
+
+Use `expert_only` instead of `full_vlm` for the lower-memory action-expert
+comparison. The full-VLM mode performs a mandatory 20-step memory probe before
+the real run. `EPOCHS` defaults to 5; paths, task description, output root and
+offline Hugging Face cache can be overridden through the environment variables
+listed by `scripts/run_pi05_1000plus.sh --help`.
+
 ---
 
 ## Outputs
