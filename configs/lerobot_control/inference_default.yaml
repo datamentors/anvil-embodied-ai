@@ -14,6 +14,9 @@ model:
   # VLA task prompt — required for SmolVLA / Pi0 / Pi0.5, ignored for ACT / Diffusion
   # Set to the task the model was trained/finetuned for.
   task_description: null
+  # Verify checkpoint_manifest.sha256 or SHA256SUMS.expected before allocating
+  # the model. Keep true for real-robot inference.
+  require_checkpoint_manifest: true
 
 # -----------------------------------------------------------------------------
 # Inference Tuning (per model type)
@@ -53,6 +56,16 @@ inference_tuning:
     execution_horizon: 12
     max_guidance_weight: 10.0
     prefix_attention_schedule: EXP
+    # Fail-closed RTC readiness proof. After one discarded cold forward and one
+    # unpublished seed, exactly five guided refills must pass queue, age, and
+    # useful-overlap bounds. Two steps cover measured latency variation, one
+    # step covers queue-index phase, and one reserves scheduler jitter. At least
+    # three guided steps must survive those bounds.
+    readiness_guided_forwards: 5
+    readiness_latency_guard_steps: 2
+    readiness_index_phase_tolerance_steps: 1
+    readiness_scheduler_guard_steps: 1
+    readiness_min_guided_overlap_steps: 3
 
 # -----------------------------------------------------------------------------
 # Joint Configuration
@@ -141,7 +154,44 @@ cameras:
 #   Use to overcome motor friction when model delta outputs are too small to move joints.
 #   Commands are held at last published value until cumulative change exceeds this threshold.
 #   Default: disabled (null). Recommended starting value: 0.05.
-# Uncomment to override defaults:
-# safety:
-#   max_position_delta: 0.1
-#   min_position_delta: 0.05
+safety:
+  max_position_delta: 0.1
+  min_position_delta: null
+  # Numerical comparison tolerance only. It may not exceed 1e-6 rad.
+  joint_limit_tolerance: 0.000001
+  # Absolute URDF limits keyed by the exact JointState/controller joint name.
+  # This mapping must exactly cover all 16 commanded joints or startup aborts.
+  joint_position_limits:
+    follower_l_finger_joint1: [0.0, 0.05]
+    follower_l_joint1: [-2.3562, 2.3562]
+    follower_l_joint2: [-3.3161, 0.1745]
+    follower_l_joint3: [-1.570796, 1.570796]
+    follower_l_joint4: [0.0, 2.443461]
+    follower_l_joint5: [-1.570796, 1.570796]
+    follower_l_joint6: [-0.785398, 0.785398]
+    follower_l_joint7: [-1.570796, 1.570796]
+    follower_r_finger_joint1: [0.0, 0.05]
+    follower_r_joint1: [-2.3562, 2.3562]
+    follower_r_joint2: [-0.1745, 3.3161]
+    follower_r_joint3: [-1.570796, 1.570796]
+    follower_r_joint4: [0.0, 2.443461]
+    follower_r_joint5: [-1.570796, 1.570796]
+    follower_r_joint6: [-0.785398, 0.785398]
+    follower_r_joint7: [-1.570796, 1.570796]
+
+# Input watchdog — fail-closed and enabled for every inference run.
+# A missing/stale input, non-advancing observation, sensor skew, invalid joint
+# value, inference exception, or invalid action latches publication off. The
+# node never auto-resumes: after fixing the input, restart the node or call
+#   ros2 service call /lerobot_inference/rearm_watchdog std_srvs/srv/Trigger '{}'
+watchdog:
+  # Local monotonic time since receipt; independent of ROS/system clock jumps.
+  camera_timeout_sec: 0.25
+  joint_state_timeout_sec: 0.10
+  # Maximum difference between local receipt times in one sensor set.
+  max_sensor_skew_sec: 0.10
+  # Maximum time an action may remain based on the last accepted observation.
+  # Pi0.5 inference observed at ~0.55–0.59 s; keep margin above normal latency.
+  max_action_age_sec: 1.50
+  # Allows drivers and image worker processes to start before latching missing inputs.
+  startup_grace_sec: 10.0

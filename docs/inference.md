@@ -27,6 +27,7 @@ cp .env.example .env
 | `ECHO_TOPIC_ONLY` | No | `true` = skip model loading, subscribe topics and log FPS only. For verifying DDS connectivity without a GPU or checkpoint. Equivalent to `--echo-topic-only`. |
 | `MONITOR_ENABLE` | No | `true` = enable the inference monitor node (records per-step CSV + PNG report). Equivalent to `--monitor-enable`, but without the auto-plot on exit and output dir pre-creation that the flag provides. |
 | `DEBUG` | No | `true` = enable extra metrics: action smoothness, queue depth stats, Action FPS. |
+| `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS` | No | Native CPU thread-pool limits (default: `4`). These prevent the inference process and spawned camera workers from oversubscribing the host and delaying CUDA work. |
 
 For full descriptions and defaults, see [`.env.example`](../.env.example).
 
@@ -127,18 +128,167 @@ inference_tuning:
     # Steps consumed per chunk before the next inference fires.
     max_guidance_weight: 10.0
     prefix_attention_schedule: EXP
+    readiness_guided_forwards: 5
+    # Required consecutive guided refills before publication can start.
+    readiness_latency_guard_steps: 2
+    # Extra control periods added to the worst guided latency.
+    readiness_index_phase_tolerance_steps: 1
+    # Allowed control-timer phase difference between wall time and queue index.
+    readiness_scheduler_guard_steps: 1
+    # Additional queue step reserved for dispatch/polling scheduler jitter.
+    readiness_min_guided_overlap_steps: 3
+    # Minimum guided prefix that must survive the bounded refill latency.
+
+diagnostics:
+  rtc_timing: false
+  rtc_cuda_events: false
+  # Enable only in a reviewed shadow profile. The node emits correlated
+  # per-stage wall timings and queries CUDA events asynchronously, without
+  # synchronizing the inference stream or changing readiness calculations.
 ```
+
+**Joint-state process isolation:** the `joint_state_worker` launch
+parameter moves the `/joint_states` subscription into a spawned ROS2 process.
+The complete serialized message and callback-ingress monotonic timestamp cross
+a seqlock-protected shared-memory slot and are parsed normally in the main
+process. The option defaults to `false`. Debug-only command topics may enable
+it directly; a live profile must additionally set
+`runtime.allow_live_joint_state_worker: true` so promotion cannot happen by
+changing only a topic name.
 
 **Safety limits:**
 ```yaml
-# safety:
-#   max_position_delta: 0.1
-#   # Hard limit on joint position change per control step (radians).
-#   min_position_delta: 0.05
-#   # Minimum cumulative change before publishing a new command.
-#   # Holds the last command until threshold is crossed — useful for
-#   # overcoming motor dead zones / friction. Default: disabled (null).
+safety:
+  max_position_delta: 0.1
+  # Hard limit on joint position change per control step (radians).
+  min_position_delta: null
+  joint_limit_tolerance: 0.000001
+  joint_position_limits:
+    # Required full mapping keyed by exact ROS joint names. See the default
+    # config for all 16 values sourced from the deployed robot URDF.
+    follower_l_finger_joint1: [0.0, 0.05]
+    # ... all remaining configured joints ...
 ```
+
+Absolute limits are evaluated after model/controller reordering, before the
+delta limiter can hide an invalid raw target, and once more on the final
+command. The node prepares and validates both arms before publishing either
+one, so a bad target on the right arm cannot leave a left-only command behind.
+Missing, extra, inverted, or non-finite limit entries abort startup.
+Targets outside the configured limit plus the numerical tolerance always fail
+closed. The runtime does not provide a diagnostic mode that clips arbitrary
+model targets into range; correcting the policy or its normalization cannot be
+replaced by a permissive deployment setting.
+
+**Fail-closed input watchdog:**
+```yaml
+watchdog:
+  camera_timeout_sec: 0.25
+  joint_state_timeout_sec: 0.10
+  max_sensor_skew_sec: 0.10
+  max_action_age_sec: 1.50
+  startup_grace_sec: 10.0
+```
+
+Freshness uses local monotonic receive time, not ROS message stamps. Publication
+starts only after all configured cameras and required joints are present, finite,
+fresh, mutually synchronized, and have produced a new sequence. If an input
+stops, an observation repeats, inference fails, or an action is invalid, the node:
+
+1. latches the watchdog;
+2. clears RTC, classic-policy, delta-restore, and limiter state;
+3. suppresses all action publication; and
+4. discards inference results that were already running when the fault occurred.
+
+For RTC policies, input health and policy readiness are separate gates. After
+startup, reset, or rearm, the node performs these phases without publishing:
+
+1. discard one unconditional GPU/model cold forward;
+2. merge one fresh unguided chunk as a provisional seed; and
+3. require five consecutive guided refills to pass all sustainability bounds.
+
+RTC alignment and action freshness use separate clocks. Under the queue lock,
+dispatch captures the queue identity, depth `q0`, consumer index `i0`, leftover,
+and time `t0`. Immediately before merge under the same lock it captures `q1`,
+`i1`, and `t1`. With runtime `L=t1-t0` and index-phase tolerance `P=1`:
+
+```text
+pre-ready:  i1-i0 = 0; D_merge = ceil(f * L)
+post-ready: D_idx = i1-i0 = q0-q1
+            0 <= D_idx <= ceil(f * L)+P
+            q1 >= 1; D_merge = D_idx
+```
+
+Queue identity, index, depth, leftover length, or consumption above the
+wall-clock upper bound is a fail-closed rejection. Consumption may be below the
+wall estimate when the ROS executor delays the publish timer; in that case the
+exact queue index remains authoritative because it is aligned with the leftover
+passed to RTC. Source observation age is not used as a merge delay; it remains
+the independent freshness/provenance clock.
+
+For chunk length `C`, control frequency `f`, queue threshold `T`, exact source
+age at merge `A`, action-age limit `M`, execution horizon `H`, latency guard
+`G=2`, scheduler guard `S=1`, and the last five guided runtimes:
+
+```text
+L_bound   = max(last 5 L) + G/f
+D_bound   = ceil(f * max(last 5 L)) + G
+q_start   = C - D_merge
+wait      = max(0, q_start - T)
+q_trigger = q_start - wait
+q_required = max(0, q_trigger - S)
+
+q_required >= D_bound + 1
+A + (wait + S)/f + L_bound < M
+max(0, min(H, q_required) - D_bound) >= 3
+```
+
+Only the fifth consecutive passing refill reports `[RTC] POLICY_READY`. A miss
+before readiness discards the provisional queue and seed; the next result must
+be unguided and seed a new proof. Before readiness the queue threshold is
+intentionally ignored because publication cannot drain the provisional queue.
+A miss after readiness—including an empty queue, stale result, queue/index
+misalignment, insufficient refill coverage, or insufficient useful
+guidance—latches the watchdog and clears the queue while holding the same safety
+lock used by publication.
+
+These checks deliberately expose timing/configuration incompatibilities. For
+example, `C=50`, `f=30`, `H=12`, and steady `0.55 s` guided forwards yield a
+19-step bounded refill delay but only 12 horizon steps, so useful guided overlap
+is zero and readiness remains closed. Changing `execution_horizon` changes RTC
+policy behavior and requires a reviewed shadow run; do not bypass the gate or
+raise `max_action_age_sec` merely to make it open.
+
+Compressed-camera workers validate the JPEG envelope and capture native decoder
+diagnostics around each decode. A frame with invalid SOI/EOI markers, any native
+decoder warning, an exception, or a missing decoded image is discarded before
+shared memory and does not advance that camera's sequence. Repeated corruption
+therefore reduces the measured input rate and eventually trips the same camera
+freshness watchdog instead of feeding a partially decoded image to the policy.
+
+The watchdog never resumes automatically. Restart the inference node, or first
+restore every input and then explicitly rearm it:
+
+```bash
+ros2 service call /lerobot_inference/rearm_watchdog std_srvs/srv/Trigger '{}'
+```
+
+Rearm is rejected until every required input is healthy and has advanced beyond
+the sequence observed at the fault. The action queue stays empty until a new
+complete observation has been accepted after rearm.
+
+For Pi0.5, startup also fails unless `model.safetensors`, both saved processor
+pipelines, and a valid SHA-256 manifest are present. Create the manifest after
+copying the checkpoint into its isolated deployment directory:
+
+```bash
+python3 scripts/create_checkpoint_manifest.py /absolute/path/to/pretrained_model
+```
+
+The loader accepts `SHA256SUMS.expected` or `checkpoint_manifest.sha256`, hashes
+every entry before allocating the model, and verifies that strict state-dict
+loading actually completed. This guards against LeRobot 0.5.1 returning a
+randomly initialized Pi0.5 model after an internal weight-loading error.
 
 ## DDS Middleware Selection
 

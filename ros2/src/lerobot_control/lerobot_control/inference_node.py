@@ -22,6 +22,7 @@ import math
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -32,11 +33,86 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallb
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
+from std_srvs.srv import Trigger
 
 from .action_limiter import ActionLimiter
 from .delta_restore import resolve_action_type, restore_delta_chunk
+from .input_watchdog import InputSnapshot, InputWatchdog, WatchdogResult
 from .metrics_tracker import MetricsTracker
 from .model_loader import ModelLoader, set_deterministic_mode
+
+
+@dataclass(frozen=True)
+class RTCReadinessAssessment:
+    """Exact queue, age, and guidance margins for one RTC refill."""
+
+    sustainable: bool
+    candidate_delay_steps: int
+    q_start: int
+    wait_steps: int
+    q_trigger: int
+    scheduler_guard_steps: int
+    q_required: int
+    latency_bound_sec: float
+    refill_delay_bound_steps: int
+    coverage_required_steps: int
+    age_at_next_refill_sec: float
+    useful_guided_overlap_steps: int
+    failures: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RTCMergeAlignment:
+    """Observed queue consumption and the delay used to align a new chunk."""
+
+    requested_at_monotonic: float
+    merge_at_monotonic: float
+    runtime_sec: float
+    wall_delay_steps: int
+    consumed_steps: int
+    merge_delay_steps: int
+    queue_size_at_request: int
+    queue_size_at_merge: int
+
+
+@dataclass(frozen=True)
+class RTCDispatchSnapshot:
+    """Identity, depth, index, and clock captured with an RTC leftover."""
+
+    queue: object
+    queue_size: int
+    action_index: int
+    requested_at_monotonic: float
+
+
+@dataclass(frozen=True)
+class VLAObservationTiming:
+    """Monotonic stages used to build one preprocessed VLA observation."""
+
+    callback_started_monotonic: float
+    read_started_monotonic: float
+    read_completed_monotonic: float
+    preprocess_started_monotonic: float
+    ready_at_monotonic: float
+
+
+@dataclass(frozen=True)
+class PendingRTCCudaTiming:
+    """Non-blocking CUDA events correlated with one RTC timing sample."""
+
+    sample_id: int
+    start_event: object
+    end_event: object
+
+
+@dataclass
+class RTCMergeStageTiming:
+    """Optional diagnostic timestamps around the action-queue merge."""
+
+    queue_lock_requested_at_monotonic: float | None = None
+    queue_lock_acquired_at_monotonic: float | None = None
+    alignment_merge_at_monotonic: float | None = None
+    merge_completed_at_monotonic: float | None = None
 
 
 class LeRobotInferenceNode(Node):
@@ -68,8 +144,28 @@ class LeRobotInferenceNode(Node):
             debug_image_dir=self._debug_image_dir,
         )
 
+        # The safety lock is always the outermost lock when locks are nested.
+        # The model, observation, and action-queue locks are never nested with
+        # one another. Inference never enters a queue unless both its captured
+        # watchdog epoch and policy epoch are still current.
+        self._safety_lock = threading.RLock()
+        self._model_lock = threading.Lock()
+        self._action_queue_lock = threading.Lock()
+        self._policy_epoch: int = 0
+        self._watchdog = InputWatchdog(
+            camera_timeout_sec=self._watchdog_camera_timeout_sec,
+            joint_state_timeout_sec=self._watchdog_joint_timeout_sec,
+            max_sensor_skew_sec=self._watchdog_max_sensor_skew_sec,
+            max_action_age_sec=self._watchdog_max_action_age_sec,
+            startup_grace_sec=self._watchdog_startup_grace_sec,
+            started_at_monotonic=time.monotonic(),
+        )
+
         # Non-VLA action buffer (ACT/Diffusion put actions here from obs timer)
         self._classic_action_deque: deque = deque(maxlen=10)
+        self._classic_chunk_source_monotonic: float | None = None
+        self._vla_action_source_monotonic: float | None = None
+        self._vla_action_epoch: int | None = None
         # Reference joint state captured at the moment each action chunk was
         # generated (in model/observation order).  All queued steps in the chunk
         # share this reference so delta restoration is consistent with training.
@@ -101,6 +197,13 @@ class LeRobotInferenceNode(Node):
             ]
 
             self._setup_publishers()
+            self._watchdog_service_group = MutuallyExclusiveCallbackGroup()
+            self._watchdog_rearm_service = self.create_service(
+                Trigger,
+                "~/rearm_watchdog",
+                self._handle_watchdog_rearm,
+                callback_group=self._watchdog_service_group,
+            )
 
             # Unified split-timer architecture for all models:
             #   _obs_update:    preprocess (+ inference for non-VLA)
@@ -118,6 +221,12 @@ class LeRobotInferenceNode(Node):
                 self._publish_loop,
                 callback_group=self._publish_callback_group,
             )
+            # Model loading can take long enough to exceed the configured grace
+            # period. Start the safety clock and RTC worker only after publishers,
+            # queues, and callbacks are fully initialized.
+            self._watchdog.started_at_monotonic = time.monotonic()
+            if self._is_vla:
+                self._start_inference_thread()
 
         self._log_startup()
 
@@ -163,6 +272,7 @@ class LeRobotInferenceNode(Node):
         self.declare_parameter("debug", False)
         self.declare_parameter("debug_image_dir", "")
         self.declare_parameter("monitor_enable", False)
+        self.declare_parameter("joint_state_worker", False)
 
         # Static fields from ROS2 params
         self.echo_topic_only = self.get_parameter("echo_topic_only").value
@@ -176,20 +286,107 @@ class LeRobotInferenceNode(Node):
 
         self.control_freq = self.get_parameter("control_frequency").value
         self.device = self.get_parameter("device").value
+        if not math.isfinite(self.control_freq) or self.control_freq <= 0:
+            raise ValueError("control_frequency must be finite and > 0")
 
         # Load YAML config
         config_file = self.get_parameter("config_file").value
         self.config = self._load_yaml_config(config_file)
+        joint_state_worker = self.get_parameter("joint_state_worker").value
+        if not isinstance(joint_state_worker, bool):
+            raise ValueError("joint_state_worker parameter must be a boolean")
+        if joint_state_worker:
+            runtime_config = self.config.setdefault("runtime", {})
+            if not isinstance(runtime_config, dict):
+                raise ValueError("runtime must be a mapping")
+            runtime_config["joint_state_worker"] = True
+
+        diagnostics_config = self.config.get("diagnostics", {})
+        self._rtc_timing_enabled = diagnostics_config.get("rtc_timing", False)
+        self._rtc_cuda_timing_enabled = diagnostics_config.get(
+            "rtc_cuda_events", False
+        )
+        if not isinstance(self._rtc_timing_enabled, bool):
+            raise ValueError("diagnostics.rtc_timing must be a boolean")
+        if not isinstance(self._rtc_cuda_timing_enabled, bool):
+            raise ValueError("diagnostics.rtc_cuda_events must be a boolean")
+        if self._rtc_cuda_timing_enabled and not self._rtc_timing_enabled:
+            raise ValueError(
+                "diagnostics.rtc_cuda_events requires diagnostics.rtc_timing"
+            )
 
         # Fields from YAML config
         safety_config = self.config.get("safety", {})
         self.max_position_delta = safety_config.get("max_position_delta", 0.1)
         self.min_position_delta = safety_config.get("min_position_delta", None)
+        if (
+            not math.isfinite(self.max_position_delta)
+            or self.max_position_delta <= 0
+        ):
+            raise ValueError("safety.max_position_delta must be finite and > 0")
+        if self.min_position_delta is not None and (
+            not math.isfinite(self.min_position_delta)
+            or self.min_position_delta < 0
+        ):
+            raise ValueError("safety.min_position_delta must be finite and >= 0")
+        self._joint_limit_tolerance = self._parse_joint_limit_tolerance(
+            safety_config.get("joint_limit_tolerance", 1e-6)
+        )
+        raw_joint_position_limits = safety_config.get("joint_position_limits", {})
+
+        watchdog_config = self.config.get("watchdog", {})
+        self._watchdog_camera_timeout_sec = float(
+            watchdog_config.get("camera_timeout_sec", 0.25)
+        )
+        self._watchdog_joint_timeout_sec = float(
+            watchdog_config.get("joint_state_timeout_sec", 0.10)
+        )
+        self._watchdog_startup_grace_sec = float(
+            watchdog_config.get("startup_grace_sec", 10.0)
+        )
+        self._watchdog_max_sensor_skew_sec = float(
+            watchdog_config.get("max_sensor_skew_sec", 0.10)
+        )
+        self._watchdog_max_action_age_sec = float(
+            watchdog_config.get("max_action_age_sec", 1.50)
+        )
+        if (
+            not math.isfinite(self._watchdog_camera_timeout_sec)
+            or self._watchdog_camera_timeout_sec <= 0
+        ):
+            raise ValueError("watchdog.camera_timeout_sec must be finite and > 0")
+        if (
+            not math.isfinite(self._watchdog_joint_timeout_sec)
+            or self._watchdog_joint_timeout_sec <= 0
+        ):
+            raise ValueError("watchdog.joint_state_timeout_sec must be finite and > 0")
+        if (
+            not math.isfinite(self._watchdog_startup_grace_sec)
+            or self._watchdog_startup_grace_sec < 0
+        ):
+            raise ValueError("watchdog.startup_grace_sec must be finite and >= 0")
+        if self._watchdog_max_sensor_skew_sec <= 0:
+            raise ValueError("watchdog.max_sensor_skew_sec must be finite and > 0")
+        if not math.isfinite(self._watchdog_max_sensor_skew_sec):
+            raise ValueError("watchdog.max_sensor_skew_sec must be finite and > 0")
+        if (
+            not math.isfinite(self._watchdog_max_action_age_sec)
+            or self._watchdog_max_action_age_sec <= 0
+        ):
+            raise ValueError("watchdog.max_action_age_sec must be finite and > 0")
 
         self.joint_state_topic = self.config.get("joint_state_topic", "/joint_states")
         _cameras_cfg: dict = self.config.get("cameras", {})
         self.camera_mapping = _cameras_cfg.get("mapping", {})
         self.camera_names = list(self.camera_mapping.values())
+        duplicate_camera_names = sorted(
+            name for name in set(self.camera_names) if self.camera_names.count(name) > 1
+        )
+        if duplicate_camera_names:
+            raise ValueError(
+                "camera mappings must use unique model feature names; duplicates: "
+                + ", ".join(duplicate_camera_names)
+            )
 
         # Build per-camera expected fps dict (camera name → expected fps).
         # Warning threshold = expected * 2/3, independent of control_frequency.
@@ -203,6 +400,12 @@ class LeRobotInferenceNode(Node):
 
         self.arms_config = self.config.get("arms", {})
         self.joint_names_config = self.config.get("joint_names", {})
+        if raw_joint_position_limits or not self.echo_topic_only:
+            self._joint_position_limits = self._parse_joint_position_limits(
+                raw_joint_position_limits
+            )
+        else:
+            self._joint_position_limits = {}
 
         # Inference tuning — per model type (resolved after model_type is known)
         self._tuning_config = self.config.get("inference_tuning", {})
@@ -251,6 +454,78 @@ class LeRobotInferenceNode(Node):
 
         with open(config_path) as f:
             return yaml.safe_load(f)
+
+    def _expected_controller_joint_names(self) -> tuple[str, ...]:
+        """Return every full ROS joint name targeted by configured action slices."""
+        controller_order = self.joint_names_config.get(
+            "controller_joint_order",
+            self.joint_names_config.get("joint_order", []),
+        )
+        names: list[str] = []
+        for arm_name, arm_config in self.arms_config.items():
+            start = int(arm_config.get("action_start", 0))
+            end = int(arm_config.get("action_end", 0))
+            arm_dim = end - start
+            ros_prefix = arm_config.get("ros_prefix", arm_name)
+            if arm_dim <= 0 or len(controller_order) < arm_dim:
+                raise ValueError(
+                    f"invalid action slice/controller order for arm {arm_name}: "
+                    f"slice=[{start}:{end}], controller joints={len(controller_order)}"
+                )
+            names.extend(f"{ros_prefix}_{joint}" for joint in controller_order[:arm_dim])
+        if len(names) != len(set(names)):
+            raise ValueError("configured controller joint names are not unique")
+        return tuple(names)
+
+    @staticmethod
+    def _parse_joint_limit_tolerance(raw_tolerance: float) -> float:
+        """Validate the small numerical tolerance used for absolute limits."""
+        tolerance = float(raw_tolerance)
+        if not math.isfinite(tolerance) or tolerance < 0 or tolerance > 1e-6:
+            raise ValueError(
+                "safety.joint_limit_tolerance must be finite and between 0 and 1e-6"
+            )
+        return tolerance
+
+    def _parse_joint_position_limits(
+        self,
+        raw_limits: dict,
+    ) -> dict[str, tuple[float, float]]:
+        """Validate a complete absolute limit mapping for every commanded joint."""
+        expected_names = self._expected_controller_joint_names()
+        if not raw_limits:
+            raise ValueError(
+                "safety.joint_position_limits is required for real-robot inference"
+            )
+        if not isinstance(raw_limits, dict):
+            raise ValueError("safety.joint_position_limits must be a mapping")
+
+        actual_names = set(raw_limits)
+        missing = sorted(set(expected_names) - actual_names)
+        extra = sorted(actual_names - set(expected_names))
+        if missing or extra:
+            details = []
+            if missing:
+                details.append("missing=" + ",".join(missing))
+            if extra:
+                details.append("unexpected=" + ",".join(extra))
+            raise ValueError(
+                "safety.joint_position_limits must exactly cover commanded joints: "
+                + "; ".join(details)
+            )
+
+        parsed: dict[str, tuple[float, float]] = {}
+        for name in expected_names:
+            bounds = raw_limits[name]
+            if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+                raise ValueError(f"joint limit for {name} must be [lower, upper]")
+            lower, upper = (float(bounds[0]), float(bounds[1]))
+            if not math.isfinite(lower) or not math.isfinite(upper) or lower >= upper:
+                raise ValueError(
+                    f"invalid joint limit for {name}: lower={lower}, upper={upper}"
+                )
+            parsed[name] = (lower, upper)
+        return parsed
 
     def _read_checkpoint_metadata(self) -> dict:
         """
@@ -362,6 +637,9 @@ class LeRobotInferenceNode(Node):
             config_overrides=config_overrides,
             logger=self.get_logger(),
             rtc_config_yaml=getattr(self, "rtc_config_yaml", {}),
+            require_checkpoint_manifest=self.config.get("model", {}).get(
+                "require_checkpoint_manifest", True
+            ),
         )
         self.model, self.preprocessor, self.postprocessor = loader.load_with_processors()
         self._loader = loader
@@ -372,7 +650,6 @@ class LeRobotInferenceNode(Node):
         # VLA models: set up ActionQueue and start background inference thread
         if self._is_vla:
             self._setup_vla_inference()
-            self._start_inference_thread()
         else:
             # Classic (ACT/Diffusion): initialise latency tracker
             from lerobot_control.latency_stats import LatencyStats
@@ -405,6 +682,15 @@ class LeRobotInferenceNode(Node):
         logger.info(f"Frequency:  {self.control_freq} Hz")
         if not self.echo_topic_only:
             logger.info(f"Max delta:  {self.max_position_delta} rad")
+            logger.info(
+                "Watchdog:  fail-closed "
+                f"(camera={self._watchdog_camera_timeout_sec:.3f}s, "
+                f"joints={self._watchdog_joint_timeout_sec:.3f}s, "
+                f"skew={self._watchdog_max_sensor_skew_sec:.3f}s, "
+                f"action_age={self._watchdog_max_action_age_sec:.3f}s, "
+                f"startup={self._watchdog_startup_grace_sec:.1f}s)"
+            )
+            logger.info("Rearm:     ~/rearm_watchdog (std_srvs/Trigger)")
 
         h, w, _ = self.image_shape
         res_note = "auto-detected from checkpoint" if self.model_path else "default"
@@ -463,6 +749,29 @@ class LeRobotInferenceNode(Node):
             logger.info(f"│  max_guidance_weight= {rtc.get('max_guidance_weight', 10.0):<6}                           │")
             logger.info(f"│  attention_schedule = {rtc.get('prefix_attention_schedule', 'EXP'):<6}                           │")
             logger.info(f"│  queue_threshold    = {rtc.get('queue_trigger_threshold', 30):<4}                             │")
+            logger.info(
+                f"│  readiness_forwards = {rtc.get('readiness_guided_forwards', 5):<4}"
+                "                             │"
+            )
+            logger.info(
+                f"│  latency_guard      = {rtc.get('readiness_latency_guard_steps', 2):<4}"
+                " steps                       │"
+            )
+            logger.info(
+                "│  index_phase_guard  = "
+                f"{rtc.get('readiness_index_phase_tolerance_steps', 1):<4}"
+                " steps                       │"
+            )
+            logger.info(
+                "│  scheduler_guard    = "
+                f"{rtc.get('readiness_scheduler_guard_steps', 1):<4}"
+                " steps                       │"
+            )
+            logger.info(
+                "│  min_guided_overlap = "
+                f"{rtc.get('readiness_min_guided_overlap_steps', 3):<4}"
+                " steps                       │"
+            )
             logger.info("└─────────────────────────────────────────────────────────┘")
 
     def _setup_publishers(self) -> None:
@@ -482,28 +791,1102 @@ class LeRobotInferenceNode(Node):
             self._monitor_cmd_pub = self.create_publisher(Float64MultiArray, "/monitor/control_cmd", 10)
             self.get_logger().info("Monitor topics enabled: /monitor/{obs_state,raw_output,control_cmd}")
 
-    def _setup_vla_inference(self) -> None:
-        """Initialise ActionQueue and LatencyTracker for VLA / RTC mode."""
+    def _new_vla_action_queue(self):
+        """Create an empty RTC action queue from the loaded model config."""
         from lerobot.policies.rtc.action_queue import ActionQueue
 
+        return ActionQueue(self.model.config.rtc_config)
+
+    def _invalidate_action_state_locked(self) -> None:
+        """Clear observations and every external action buffer.
+
+        The caller must hold ``_safety_lock``. Replacing the RTC queue, rather
+        than draining it, prevents a publisher from retaining a reference to an
+        old action after a safety or policy epoch transition. Advancing the
+        policy epoch also rejects a forward pass that was already in flight;
+        policy resets do not alter the input-watchdog state or epoch.
+        """
+        self._policy_epoch = getattr(self, "_policy_epoch", 0) + 1
+        self._classic_action_deque.clear()
+        self._classic_chunk_source_monotonic = None
+        self._vla_action_source_monotonic = None
+        self._vla_action_epoch = None
+        self._reset_delta_state()
+
+        # A fault, explicit rearm, or policy reset must return RTC to the same
+        # fail-closed startup state. The next forward pass warms the runtime but
+        # can never enter the action queue; only a subsequent fresh result may
+        # make the policy ready for publication.
+        if self._is_vla:
+            self._vla_warmup_pending = True
+            self._vla_policy_ready = False
+            self._vla_stale_result_count = 0
+            self._vla_seeded = False
+            self._rtc_guided_streak = 0
+            if hasattr(self, "_rtc_guided_latencies"):
+                self._rtc_guided_latencies.clear()
+            if hasattr(self, "_latency_tracker"):
+                self._latency_tracker.reset()
+
+        if hasattr(self, "action_limiter") and hasattr(self.action_limiter, "reset"):
+            self.action_limiter.reset()
+
+        # Classic policies keep additional normalized action chunks internally.
+        # Empty them immediately on a fault without invoking a potentially slow
+        # model reset from a timer callback.
+        if hasattr(self, "model"):
+            with self._model_lock:
+                if hasattr(self.model, "_action_queue"):
+                    queue = self.model._action_queue
+                    if hasattr(queue, "clear"):
+                        queue.clear()
+                if hasattr(self.model, "_queues") and self.model._queues is not None:
+                    queues = (
+                        self.model._queues.values()
+                        if hasattr(self.model._queues, "values")
+                        else (self.model._queues,)
+                    )
+                    for queue in queues:
+                        if hasattr(queue, "clear"):
+                            queue.clear()
+
+        if hasattr(self, "_obs_lock"):
+            with self._obs_lock:
+                self._latest_obs = None
+                self._latest_obs_timing = None
+                self._last_inferred_observation_sequence = None
+
+        if hasattr(self, "_action_queue"):
+            with self._action_queue_lock:
+                self._action_queue = self._new_vla_action_queue()
+
+    def _apply_watchdog_result_locked(self, result: WatchdogResult) -> None:
+        """Apply queue invalidation for a watchdog transition."""
+        if result.fault_transition:
+            self._invalidate_action_state_locked()
+            self.get_logger().error(
+                f"[WATCHDOG] LATCHED epoch={result.epoch}: {result.reason}. "
+                "Action publication is suppressed; explicit restart/rearm required."
+            )
+        elif result.armed_transition:
+            self.get_logger().info(
+                f"[WATCHDOG] ARMED epoch={result.epoch}: complete fresh inputs received"
+            )
+
+    def _evaluate_watchdog(self) -> bool:
+        """Evaluate current input freshness and atomically handle a trip."""
+        try:
+            snapshot = self.strategy.get_input_snapshot(self.camera_names)
+        except Exception as exc:
+            self._latch_watchdog(
+                f"input snapshot read failed: {type(exc).__name__}: {exc}",
+                snapshot=None,
+                read_snapshot=False,
+            )
+            return False
+        with self._safety_lock:
+            result = self._watchdog.evaluate(snapshot, time.monotonic())
+            self._apply_watchdog_result_locked(result)
+            return result.publish_allowed
+
+    def _latch_watchdog(
+        self,
+        reason: str,
+        snapshot: InputSnapshot | None = None,
+        *,
+        read_snapshot: bool = True,
+    ) -> None:
+        """Latch a non-freshness runtime fault through the same safety path."""
+        if snapshot is None and read_snapshot:
+            try:
+                snapshot = self.strategy.get_input_snapshot(self.camera_names)
+            except Exception as exc:
+                reason = (
+                    f"{reason}; input snapshot read also failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        with self._safety_lock:
+            result = self._watchdog.trip(reason, snapshot)
+            self._apply_watchdog_result_locked(result)
+
+    def _handle_watchdog_rearm(self, _request, response):
+        """Explicitly rearm only after every input recovered and advanced."""
+        try:
+            snapshot = self.strategy.get_input_snapshot(self.camera_names)
+        except Exception as exc:
+            message = (
+                "rearm input snapshot read failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            self._latch_watchdog(
+                message,
+                snapshot=None,
+                read_snapshot=False,
+            )
+            response.success = False
+            response.message = message
+            self.get_logger().warn(f"[WATCHDOG] Rearm rejected: {message}")
+            return response
+        with self._safety_lock:
+            success, message = self._watchdog.rearm(snapshot, time.monotonic())
+            if not success:
+                response.success = False
+                response.message = message
+                self.get_logger().warn(f"[WATCHDOG] Rearm rejected: {message}")
+                return response
+            self._invalidate_action_state_locked()
+            epoch = self._watchdog.epoch
+            try:
+                # Keep the safety lock through reset so no timer or inference
+                # worker can observe the rearmed epoch before reset completes.
+                with self._model_lock:
+                    if hasattr(self.model, "reset"):
+                        self.model.reset()
+            except Exception as exc:
+                result = self._watchdog.trip(
+                    f"policy reset failed during rearm: {exc}", snapshot
+                )
+                self._apply_watchdog_result_locked(result)
+                response.success = False
+                response.message = f"policy reset failed: {exc}"
+                return response
+
+        response.success = True
+        response.message = f"watchdog rearmed at epoch {epoch}; waiting for a new observation"
+        self.get_logger().info(f"[WATCHDOG] {response.message}")
+        return response
+
+    def _setup_vla_inference(self) -> None:
+        """Initialise ActionQueue and LatencyTracker for VLA / RTC mode."""
         from lerobot_control.latency_stats import LatencyStats
 
-        self._action_queue = ActionQueue(self.model.config.rtc_config)
+        self._action_queue = self._new_vla_action_queue()
         self._latency_tracker = LatencyStats(maxlen=100)
         self._latest_obs = None
+        self._latest_obs_timing = None
+        self._last_inferred_observation_sequence = None
         self._obs_lock = threading.Lock()
         self._inference_stop = threading.Event()
-        self._rtc_threshold = self.rtc_config_yaml.get("queue_trigger_threshold", 30)
-        self._rtc_delay_fallback = self.rtc_config_yaml.get("inference_delay", 4)
+        self._rtc_timing_next_sample_id = 0
+        self._rtc_pending_cuda_timings: deque[PendingRTCCudaTiming] = deque()
+        self._rtc_threshold = int(
+            self.rtc_config_yaml.get("queue_trigger_threshold", 30)
+        )
+        self._rtc_delay_fallback = int(
+            self.rtc_config_yaml.get("inference_delay", 4)
+        )
+        self._rtc_readiness_guided_forwards = int(
+            self.rtc_config_yaml.get("readiness_guided_forwards", 5)
+        )
+        self._rtc_readiness_guard_steps = int(
+            self.rtc_config_yaml.get("readiness_latency_guard_steps", 2)
+        )
+        self._rtc_index_phase_tolerance_steps = int(
+            self.rtc_config_yaml.get(
+                "readiness_index_phase_tolerance_steps", 1
+            )
+        )
+        self._rtc_scheduler_guard_steps = int(
+            self.rtc_config_yaml.get("readiness_scheduler_guard_steps", 1)
+        )
+        self._rtc_min_guided_overlap_steps = int(
+            self.rtc_config_yaml.get("readiness_min_guided_overlap_steps", 3)
+        )
+        if self._rtc_threshold < 0:
+            raise ValueError("rtc.queue_trigger_threshold must be >= 0")
+        if self._rtc_delay_fallback < 0:
+            raise ValueError("rtc.inference_delay must be >= 0")
+        if self._rtc_readiness_guided_forwards != 5:
+            raise ValueError("rtc.readiness_guided_forwards must be exactly 5")
+        if self._rtc_readiness_guard_steps < 0:
+            raise ValueError("rtc.readiness_latency_guard_steps must be >= 0")
+        if self._rtc_index_phase_tolerance_steps < 0:
+            raise ValueError(
+                "rtc.readiness_index_phase_tolerance_steps must be >= 0"
+            )
+        if self._rtc_scheduler_guard_steps < 0:
+            raise ValueError("rtc.readiness_scheduler_guard_steps must be >= 0")
+        if self._rtc_min_guided_overlap_steps < 0:
+            raise ValueError(
+                "rtc.readiness_min_guided_overlap_steps must be >= 0"
+            )
+        self._vla_warmup_pending = True
+        self._vla_policy_ready = False
+        self._vla_stale_result_count = 0
+        self._vla_seeded = False
+        self._rtc_guided_streak = 0
+        self._rtc_guided_latencies: deque[float] = deque(
+            maxlen=self._rtc_readiness_guided_forwards
+        )
+
+    @staticmethod
+    def _rtc_chunk_length(original, processed) -> int:
+        """Return a validated common action-chunk length."""
+        try:
+            original_steps = len(original)
+            processed_steps = len(processed)
+        except (TypeError, AttributeError) as exc:
+            raise ValueError("RTC result is not a time-indexed action chunk") from exc
+        if original_steps <= 0 or processed_steps <= 0:
+            raise ValueError("RTC result contains an empty action chunk")
+        if original_steps != processed_steps:
+            raise ValueError(
+                "RTC original/processed chunk lengths differ: "
+                f"{original_steps} != {processed_steps}"
+            )
+        return int(original_steps)
+
+    @staticmethod
+    def _rtc_has_guidance(prev_actions) -> bool:
+        """Return whether the forward received at least one leftover action."""
+        if prev_actions is None:
+            return False
+        try:
+            return len(prev_actions) > 0
+        except TypeError:
+            return False
+
+    @staticmethod
+    def _rtc_inference_delay_steps(
+        *,
+        guided_latencies_sec: tuple[float, ...],
+        tracked_max_latency_sec: float | None,
+        control_freq: float,
+        fallback_steps: int,
+    ) -> int:
+        """Choose RTC's delay estimate from the active readiness window."""
+        max_latency = (
+            max(guided_latencies_sec)
+            if guided_latencies_sec
+            else tracked_max_latency_sec
+        )
+        return (
+            math.ceil(max_latency * control_freq)
+            if max_latency
+            else fallback_steps
+        )
+
+    @staticmethod
+    def _resolve_rtc_merge_alignment(
+        *,
+        queue_identity_matches: bool,
+        queue_size_before_inference: int,
+        queue_size_at_merge: int,
+        action_index_before_inference: int,
+        action_index_at_merge: int,
+        requested_at_monotonic: float,
+        merge_at_monotonic: float,
+        control_freq: float,
+        policy_ready: bool,
+        index_phase_tolerance_steps: int,
+    ) -> RTCMergeAlignment:
+        """Resolve RTC alignment from the exact leftover snapshot and queue.
+
+        ``runtime_sec`` starts when the leftover and queue index are captured
+        and ends immediately before merge. Once publication is open, real queue
+        consumption is the authoritative merge delay. The wall clock provides
+        an upper bound: the timer may be delayed by executor scheduling, but it
+        must not consume more actions than the elapsed time can explain.
+        Before readiness, publication is closed by design, so consumption must
+        be zero and the conservative wall delay is used virtually.
+        """
+        if (
+            not math.isfinite(requested_at_monotonic)
+            or not math.isfinite(merge_at_monotonic)
+            or merge_at_monotonic < requested_at_monotonic
+            or not math.isfinite(control_freq)
+            or control_freq <= 0
+        ):
+            raise ValueError("RTC merge alignment has invalid timing")
+        if index_phase_tolerance_steps < 0:
+            raise ValueError("RTC index phase tolerance must be >= 0")
+        if not queue_identity_matches:
+            raise ValueError("RTC action queue changed while inference was running")
+        if (
+            isinstance(queue_size_before_inference, bool)
+            or isinstance(queue_size_at_merge, bool)
+            or isinstance(action_index_before_inference, bool)
+            or isinstance(action_index_at_merge, bool)
+            or not isinstance(queue_size_before_inference, int)
+            or not isinstance(queue_size_at_merge, int)
+            or not isinstance(action_index_before_inference, int)
+            or not isinstance(action_index_at_merge, int)
+            or queue_size_before_inference < 0
+            or queue_size_at_merge < 0
+            or action_index_before_inference < 0
+            or action_index_at_merge < action_index_before_inference
+        ):
+            raise ValueError(
+                "RTC queue depth/index regressed or is invalid: "
+                f"q_before={queue_size_before_inference}, "
+                f"q_merge={queue_size_at_merge}, "
+                f"i_before={action_index_before_inference}, "
+                f"i_merge={action_index_at_merge}"
+            )
+
+        runtime_sec = merge_at_monotonic - requested_at_monotonic
+        wall_delay_steps = math.ceil(runtime_sec * control_freq)
+        consumed_steps = action_index_at_merge - action_index_before_inference
+        queue_depth_delta = queue_size_before_inference - queue_size_at_merge
+        if queue_depth_delta != consumed_steps:
+            raise ValueError(
+                "RTC queue depth/index consumption mismatch: "
+                f"depth_delta={queue_depth_delta}, index_delta={consumed_steps}"
+            )
+
+        if not policy_ready:
+            if consumed_steps != 0:
+                raise ValueError(
+                    "RTC pre-ready queue was consumed while publication was closed: "
+                    f"consumed={consumed_steps} steps"
+                )
+            merge_delay_steps = wall_delay_steps
+        else:
+            if queue_size_at_merge < 1:
+                raise ValueError("RTC action queue emptied before refill merge")
+            phase_steps = runtime_sec * control_freq
+            maximum_consumed = (
+                math.ceil(phase_steps) + index_phase_tolerance_steps
+            )
+            if consumed_steps > maximum_consumed:
+                raise ValueError(
+                    "RTC queue consumption exceeds wall-clock upper bound: "
+                    f"consumed={consumed_steps}, maximum={maximum_consumed}, "
+                    f"runtime={runtime_sec:.6f}s"
+                )
+            merge_delay_steps = consumed_steps
+
+        return RTCMergeAlignment(
+            requested_at_monotonic=requested_at_monotonic,
+            merge_at_monotonic=merge_at_monotonic,
+            runtime_sec=runtime_sec,
+            wall_delay_steps=wall_delay_steps,
+            consumed_steps=consumed_steps,
+            merge_delay_steps=merge_delay_steps,
+            queue_size_at_request=queue_size_before_inference,
+            queue_size_at_merge=queue_size_at_merge,
+        )
+
+    @staticmethod
+    def _rtc_queue_state_locked(queue) -> tuple[int, int, int]:
+        """Read a coherent queue depth, index, and leftover length.
+
+        The caller must hold the node's outer action-queue lock. LeRobot's own
+        queue methods do not consistently take its internal lock for every
+        getter, so read its canonical fields under that internal lock when they
+        are available.
+        """
+        internal_lock = getattr(queue, "lock", None)
+        if internal_lock is not None and all(
+            hasattr(queue, name)
+            for name in ("queue", "original_queue", "last_index")
+        ):
+            with internal_lock:
+                action_index = queue.last_index
+                queue_size = (
+                    0
+                    if queue.queue is None
+                    else len(queue.queue) - action_index
+                )
+                leftover_size = (
+                    0
+                    if queue.original_queue is None
+                    else len(queue.original_queue) - action_index
+                )
+            return queue_size, action_index, leftover_size
+
+        queue_size = queue.qsize()
+        action_index = queue.get_action_index()
+        prev_actions = queue.get_left_over()
+        leftover_size = 0 if prev_actions is None else len(prev_actions)
+        return queue_size, action_index, leftover_size
+
+    def _capture_rtc_dispatch_locked(
+        self,
+    ) -> tuple[RTCDispatchSnapshot, object | None]:
+        """Capture one internally coherent queue/leftover dispatch snapshot."""
+        queue = self._action_queue
+        queue_size, action_index, leftover_size = (
+            self._rtc_queue_state_locked(queue)
+        )
+        prev_actions = queue.get_left_over()
+        try:
+            copied_leftover_size = 0 if prev_actions is None else len(prev_actions)
+        except TypeError as exc:
+            raise ValueError("RTC leftover is not a time-indexed chunk") from exc
+        if (
+            isinstance(queue_size, bool)
+            or isinstance(action_index, bool)
+            or not isinstance(queue_size, int)
+            or not isinstance(action_index, int)
+            or queue_size < 0
+            or action_index < 0
+            or leftover_size != queue_size
+            or copied_leftover_size != leftover_size
+        ):
+            raise ValueError(
+                "RTC queue/leftover snapshot is incoherent: "
+                f"queue={queue_size}, index={action_index}, "
+                f"leftover={leftover_size}, copied={copied_leftover_size}"
+            )
+        dispatch = RTCDispatchSnapshot(
+            queue=queue,
+            queue_size=queue_size,
+            action_index=action_index,
+            requested_at_monotonic=time.monotonic(),
+        )
+        return dispatch, prev_actions
+
+    @staticmethod
+    def _rtc_should_wait_for_refill(
+        *,
+        queue_size: int,
+        queue_threshold: int,
+        policy_ready: bool,
+    ) -> bool:
+        """Apply the queue threshold only after publication can drain it."""
+        return policy_ready and queue_size > queue_threshold
+
+    @staticmethod
+    def _assess_rtc_readiness(
+        *,
+        chunk_size: int,
+        candidate_delay_steps: int,
+        guided_latencies_sec: tuple[float, ...],
+        control_freq: float,
+        queue_threshold: int,
+        source_age_sec: float,
+        max_action_age_sec: float,
+        execution_horizon: int,
+        latency_guard_steps: int,
+        scheduler_guard_steps: int,
+        min_guided_overlap_steps: int,
+    ) -> RTCReadinessAssessment:
+        """Evaluate whether this chunk can survive the following RTC refill.
+
+        ``q_start`` is the new queue depth after the candidate's validated merge
+        delay. It drains to the configured trigger and reserves an additional
+        scheduler guard before the next result. That result must arrive with at
+        least one action still queued, remain inside the current chunk's exact
+        source-age budget, and preserve useful guided overlap.
+        """
+        if not guided_latencies_sec:
+            raise ValueError("RTC readiness requires guided latency samples")
+        if any(
+            not math.isfinite(latency) or latency < 0
+            for latency in guided_latencies_sec
+        ):
+            raise ValueError("RTC guided latencies must be finite and >= 0")
+        if (
+            isinstance(candidate_delay_steps, bool)
+            or not isinstance(candidate_delay_steps, int)
+            or candidate_delay_steps < 0
+        ):
+            raise ValueError("RTC candidate delay must be an integer >= 0")
+        if scheduler_guard_steps < 0:
+            raise ValueError("RTC scheduler guard must be >= 0")
+
+        q_start = max(0, chunk_size - candidate_delay_steps)
+        wait_steps = max(0, q_start - queue_threshold)
+        q_trigger = q_start - wait_steps
+        q_required = max(0, q_trigger - scheduler_guard_steps)
+
+        max_guided_latency = max(guided_latencies_sec)
+        latency_bound_sec = (
+            max_guided_latency + latency_guard_steps / control_freq
+        )
+        # guard_steps is integral, so this is exactly ceil(f * L_bound) while
+        # avoiding a floating-point ceil at an integer boundary.
+        refill_delay_bound_steps = (
+            math.ceil(max_guided_latency * control_freq) + latency_guard_steps
+        )
+        coverage_required_steps = refill_delay_bound_steps + 1
+        age_at_next_refill_sec = (
+            source_age_sec
+            + (wait_steps + scheduler_guard_steps) / control_freq
+            + latency_bound_sec
+        )
+        effective_horizon = min(execution_horizon, q_required)
+        useful_guided_overlap_steps = max(
+            0, effective_horizon - refill_delay_bound_steps
+        )
+
+        failures: list[str] = []
+        if q_start <= 0:
+            failures.append("candidate leaves an empty queue")
+        if q_required < coverage_required_steps:
+            failures.append(
+                "refill coverage "
+                f"{q_required} < {coverage_required_steps} steps"
+            )
+        if age_at_next_refill_sec >= max_action_age_sec:
+            failures.append(
+                "projected source age "
+                f"{age_at_next_refill_sec:.3f}s >= {max_action_age_sec:.3f}s"
+            )
+        if useful_guided_overlap_steps < min_guided_overlap_steps:
+            failures.append(
+                "useful guided overlap "
+                f"{useful_guided_overlap_steps} < {min_guided_overlap_steps} steps"
+            )
+
+        return RTCReadinessAssessment(
+            sustainable=not failures,
+            candidate_delay_steps=candidate_delay_steps,
+            q_start=q_start,
+            wait_steps=wait_steps,
+            q_trigger=q_trigger,
+            scheduler_guard_steps=scheduler_guard_steps,
+            q_required=q_required,
+            latency_bound_sec=latency_bound_sec,
+            refill_delay_bound_steps=refill_delay_bound_steps,
+            coverage_required_steps=coverage_required_steps,
+            age_at_next_refill_sec=age_at_next_refill_sec,
+            useful_guided_overlap_steps=useful_guided_overlap_steps,
+            failures=tuple(failures),
+        )
+
+    @staticmethod
+    def _rtc_assessment_log_fields(
+        assessment: RTCReadinessAssessment,
+        execution_horizon: int,
+    ) -> str:
+        """Render the exact readiness margins for operator logs."""
+        return (
+            f"q_start={assessment.q_start} q_trigger={assessment.q_trigger} "
+            f"scheduler_guard={assessment.scheduler_guard_steps} "
+            f"q_required={assessment.q_required} "
+            f"coverage_required={assessment.coverage_required_steps} "
+            f"L_bound={assessment.latency_bound_sec:.3f}s "
+            f"projected_age={assessment.age_at_next_refill_sec:.3f}s "
+            f"execution_horizon={execution_horizon} "
+            f"useful_overlap={assessment.useful_guided_overlap_steps}"
+        )
+
+    def _reset_rtc_readiness_streak_locked(self) -> None:
+        """Make the current provisional chunk the seed of a new trial."""
+        self._rtc_guided_streak = 0
+        self._rtc_guided_latencies.clear()
+
+    def _clear_vla_provisional_queue_locked(self) -> None:
+        """Drop an unusable pre-ready seed without changing safety epochs."""
+        with self._action_queue_lock:
+            self._action_queue = self._new_vla_action_queue()
+        self._vla_seeded = False
+        self._vla_action_source_monotonic = None
+        self._vla_action_epoch = None
+        if hasattr(self, "_latency_tracker"):
+            self._latency_tracker.reset()
+
+    def _trip_rtc_sustainability_locked(self, reason: str) -> bool:
+        """Latch and invalidate every action before a post-ready violation."""
+        result = self._watchdog.trip(f"RTC sustainability lost: {reason}", None)
+        self._apply_watchdog_result_locked(result)
+        return False
+
+    def _merge_vla_result_locked(
+        self,
+        *,
+        original,
+        processed,
+        dispatch: RTCDispatchSnapshot,
+        observation_monotonic: float,
+        epoch: int,
+        stage_timing: RTCMergeStageTiming | None = None,
+    ) -> tuple[int, RTCMergeAlignment]:
+        """Validate alignment and merge atomically against the captured queue."""
+        if stage_timing is not None:
+            stage_timing.queue_lock_requested_at_monotonic = time.monotonic()
+        with self._action_queue_lock:
+            if stage_timing is not None:
+                stage_timing.queue_lock_acquired_at_monotonic = time.monotonic()
+            merge_at_monotonic = time.monotonic()
+            if stage_timing is not None:
+                stage_timing.alignment_merge_at_monotonic = merge_at_monotonic
+            queue_size_at_merge, action_index_at_merge, leftover_size = (
+                self._rtc_queue_state_locked(self._action_queue)
+            )
+            if leftover_size != queue_size_at_merge:
+                raise ValueError(
+                    "RTC queue/leftover state diverged before merge: "
+                    f"queue={queue_size_at_merge}, leftover={leftover_size}"
+                )
+            alignment = self._resolve_rtc_merge_alignment(
+                queue_identity_matches=self._action_queue is dispatch.queue,
+                queue_size_before_inference=dispatch.queue_size,
+                queue_size_at_merge=queue_size_at_merge,
+                action_index_before_inference=dispatch.action_index,
+                action_index_at_merge=action_index_at_merge,
+                requested_at_monotonic=dispatch.requested_at_monotonic,
+                merge_at_monotonic=merge_at_monotonic,
+                control_freq=self.control_freq,
+                policy_ready=self._vla_policy_ready,
+                index_phase_tolerance_steps=(
+                    self._rtc_index_phase_tolerance_steps
+                ),
+            )
+            source_age_at_merge = merge_at_monotonic - observation_monotonic
+            if source_age_at_merge > self._watchdog.max_action_age_sec:
+                raise ValueError(
+                    "RTC result became stale before merge: "
+                    f"source_age={source_age_at_merge:.3f}s > "
+                    f"{self._watchdog.max_action_age_sec:.3f}s"
+                )
+            # LeRobot 0.5.1's built-in index check is warning-only and still
+            # accepts its caller's delay. We already validated both clocks
+            # fail-closed above, so do not rely on that advisory check here.
+            self._action_queue.merge(
+                original,
+                processed,
+                alignment.merge_delay_steps,
+                None,
+            )
+            queue_size = self._action_queue.qsize()
+            expected_queue_size = max(
+                0,
+                min(len(original), len(processed))
+                - alignment.merge_delay_steps,
+            )
+            if queue_size != expected_queue_size:
+                raise ValueError(
+                    "RTC merged queue depth is incoherent: "
+                    f"queue={queue_size}, expected={expected_queue_size}"
+                )
+            if queue_size > 0:
+                self._vla_action_source_monotonic = observation_monotonic
+                self._vla_action_epoch = epoch
+            if stage_timing is not None:
+                stage_timing.merge_completed_at_monotonic = time.monotonic()
+        return queue_size, alignment
+
+    def _commit_vla_result_locked(
+        self,
+        *,
+        original,
+        processed,
+        dispatch: RTCDispatchSnapshot,
+        observation_monotonic: float,
+        epoch: int,
+        policy_epoch: int,
+        elapsed: float,
+        completed_at_monotonic: float,
+        guided: bool,
+        stage_timing: RTCMergeStageTiming | None = None,
+    ) -> bool:
+        """Commit an RTC result only after proving sustained real-time margins.
+
+        The first successful forward is an unconditional cold-runtime warm-up
+        and is discarded. The next unguided result seeds a provisional queue,
+        but publication remains closed. Five consecutive guided refills must
+        then satisfy exact queue coverage, source age, and useful-overlap bounds
+        before ``POLICY_READY``. Any violation after readiness atomically
+        latches the watchdog and clears the queue before another publish.
+        """
+        if policy_epoch != self._policy_epoch:
+            self.get_logger().warn(
+                "[RTC] Discarded in-flight result from policy epoch "
+                f"{policy_epoch}; current policy epoch is {self._policy_epoch}"
+            )
+            return False
+
+        if not self._watchdog.is_epoch_current(epoch):
+            self.get_logger().warn(
+                f"[WATCHDOG] Discarded in-flight result from epoch {epoch}"
+            )
+            return False
+
+        if (
+            not math.isfinite(observation_monotonic)
+            or not math.isfinite(completed_at_monotonic)
+            or completed_at_monotonic < observation_monotonic
+            or not math.isfinite(elapsed)
+            or elapsed < 0
+        ):
+            result = self._watchdog.trip(
+                "RTC result has invalid monotonic timing",
+                None,
+            )
+            self._apply_watchdog_result_locked(result)
+            return False
+
+        source_age = completed_at_monotonic - observation_monotonic
+        if completed_at_monotonic + 1e-9 < dispatch.requested_at_monotonic:
+            result = self._watchdog.trip(
+                "RTC result completed before its dispatch snapshot",
+                None,
+            )
+            self._apply_watchdog_result_locked(result)
+            return False
+
+        if self._vla_warmup_pending:
+            self._vla_warmup_pending = False
+            self._vla_policy_ready = False
+            self._vla_seeded = False
+            self._reset_rtc_readiness_streak_locked()
+            self._latency_tracker.reset()
+            self.get_logger().info(
+                "[RTC] WARMUP_DISCARDED "
+                f"epoch={epoch} latency={elapsed * 1000.0:.1f}ms "
+                f"source_age={source_age:.3f}s; waiting for a provisional seed"
+            )
+            return False
+
+        if source_age > self._watchdog.max_action_age_sec:
+            self._vla_stale_result_count += 1
+            reason = (
+                f"source_age={source_age:.3f}s > "
+                f"{self._watchdog.max_action_age_sec:.3f}s"
+            )
+            if self._vla_policy_ready:
+                return self._trip_rtc_sustainability_locked(reason)
+            self._clear_vla_provisional_queue_locked()
+            self._reset_rtc_readiness_streak_locked()
+            self.get_logger().warn(
+                "[RTC] STALE_RESULT_DISCARDED "
+                f"epoch={epoch} {reason} "
+                f"(count={self._vla_stale_result_count}); readiness remains closed"
+            )
+            return False
+
+        try:
+            chunk_size = self._rtc_chunk_length(original, processed)
+        except ValueError as exc:
+            if self._vla_policy_ready:
+                return self._trip_rtc_sustainability_locked(str(exc))
+            self._clear_vla_provisional_queue_locked()
+            self._reset_rtc_readiness_streak_locked()
+            self.get_logger().warn(
+                f"[RTC] EMPTY_RESULT_DISCARDED epoch={epoch}: {exc}; "
+                "readiness remains closed"
+            )
+            return False
+
+        if not guided:
+            if self._vla_policy_ready:
+                return self._trip_rtc_sustainability_locked(
+                    "a refill ran without leftover-action guidance"
+                )
+            try:
+                queue_size, alignment = self._merge_vla_result_locked(
+                    original=original,
+                    processed=processed,
+                    dispatch=dispatch,
+                    observation_monotonic=observation_monotonic,
+                    epoch=epoch,
+                    stage_timing=stage_timing,
+                )
+            except Exception as exc:
+                self._clear_vla_provisional_queue_locked()
+                self._reset_rtc_readiness_streak_locked()
+                self.get_logger().warn(
+                    "[RTC] EMPTY_RESULT_DISCARDED "
+                    f"epoch={epoch}: merge failed: {type(exc).__name__}: {exc}; "
+                    "readiness remains closed"
+                )
+                return False
+            expected_queue_size = max(
+                0, chunk_size - alignment.merge_delay_steps
+            )
+            self._reset_rtc_readiness_streak_locked()
+            if queue_size <= 0 or queue_size != expected_queue_size:
+                self._clear_vla_provisional_queue_locked()
+                self.get_logger().warn(
+                    "[RTC] EMPTY_RESULT_DISCARDED "
+                    f"epoch={epoch} queue={queue_size} expected={expected_queue_size}; "
+                    "readiness remains closed"
+                )
+                return False
+            self._vla_seeded = True
+            self._latency_tracker.add(alignment.runtime_sec)
+            self.metrics.record_inference()
+            self.get_logger().info(
+                "[RTC] SEED_PROVISIONAL "
+                f"epoch={epoch} latency={alignment.runtime_sec * 1000.0:.1f}ms "
+                "source_age="
+                f"{alignment.merge_at_monotonic - observation_monotonic:.3f}s "
+                f"queue={queue_size}; "
+                "publication remains closed"
+            )
+            return False
+
+        if not self._vla_seeded:
+            reason = "guided result arrived without a provisional seed"
+            if self._vla_policy_ready:
+                return self._trip_rtc_sustainability_locked(reason)
+            self._clear_vla_provisional_queue_locked()
+            self._reset_rtc_readiness_streak_locked()
+            self.get_logger().warn(
+                f"[RTC] READINESS_REJECTED epoch={epoch}: {reason}"
+            )
+            return False
+
+        execution_horizon = int(
+            self.model.config.rtc_config.execution_horizon
+        )
+        try:
+            queue_size, alignment = self._merge_vla_result_locked(
+                original=original,
+                processed=processed,
+                dispatch=dispatch,
+                observation_monotonic=observation_monotonic,
+                epoch=epoch,
+                stage_timing=stage_timing,
+            )
+        except Exception as exc:
+            reason = f"merge failed: {type(exc).__name__}: {exc}"
+            if self._vla_policy_ready:
+                return self._trip_rtc_sustainability_locked(reason)
+            self._clear_vla_provisional_queue_locked()
+            self._reset_rtc_readiness_streak_locked()
+            self.get_logger().warn(
+                f"[RTC] READINESS_REJECTED epoch={epoch}: {reason}; "
+                "publication remains closed"
+            )
+            return False
+
+        candidate_latencies = tuple(
+            [*self._rtc_guided_latencies, alignment.runtime_sec][
+                -self._rtc_readiness_guided_forwards :
+            ]
+        )
+        assessment = self._assess_rtc_readiness(
+            chunk_size=chunk_size,
+            candidate_delay_steps=alignment.merge_delay_steps,
+            guided_latencies_sec=candidate_latencies,
+            control_freq=self.control_freq,
+            queue_threshold=self._rtc_threshold,
+            source_age_sec=(
+                alignment.merge_at_monotonic - observation_monotonic
+            ),
+            max_action_age_sec=self._watchdog.max_action_age_sec,
+            execution_horizon=execution_horizon,
+            latency_guard_steps=self._rtc_readiness_guard_steps,
+            scheduler_guard_steps=self._rtc_scheduler_guard_steps,
+            min_guided_overlap_steps=self._rtc_min_guided_overlap_steps,
+        )
+        fields = self._rtc_assessment_log_fields(assessment, execution_horizon)
+
+        if not assessment.sustainable and self._vla_policy_ready:
+            return self._trip_rtc_sustainability_locked(
+                f"{'; '.join(assessment.failures)}; {fields}"
+            )
+
+        self._latency_tracker.add(alignment.runtime_sec)
+        self.metrics.record_inference()
+
+        if queue_size != assessment.q_start or queue_size <= 0:
+            reason = (
+                f"merged queue depth {queue_size} != expected {assessment.q_start}"
+            )
+            if self._vla_policy_ready:
+                return self._trip_rtc_sustainability_locked(reason)
+            self._clear_vla_provisional_queue_locked()
+            self._reset_rtc_readiness_streak_locked()
+            self.get_logger().warn(
+                f"[RTC] READINESS_REJECTED epoch={epoch}: {reason}; {fields}"
+            )
+            return False
+
+        self._vla_seeded = True
+        if not assessment.sustainable:
+            # Every failed pre-ready proof starts from a fresh unguided seed;
+            # rejected guidance must never become the ancestor of readiness.
+            self._clear_vla_provisional_queue_locked()
+            self._reset_rtc_readiness_streak_locked()
+            self.get_logger().warn(
+                "[RTC] READINESS_REJECTED "
+                f"epoch={epoch}: {'; '.join(assessment.failures)}; {fields}; "
+                "streak reset to 0 and publication remains closed"
+            )
+            return False
+
+        self._rtc_guided_latencies.append(alignment.runtime_sec)
+        self._rtc_guided_streak += 1
+        if not self._vla_policy_ready:
+            if self._rtc_guided_streak < self._rtc_readiness_guided_forwards:
+                self.get_logger().info(
+                    "[RTC] READINESS_PROGRESS "
+                    f"epoch={epoch} guided={self._rtc_guided_streak}/"
+                    f"{self._rtc_readiness_guided_forwards} {fields}; "
+                    "publication remains closed"
+                )
+                return False
+            self._vla_policy_ready = True
+            self.get_logger().info(
+                "[RTC] POLICY_READY "
+                f"epoch={epoch} guided={self._rtc_guided_streak}/"
+                f"{self._rtc_readiness_guided_forwards} "
+                f"latency={alignment.runtime_sec * 1000.0:.1f}ms "
+                "source_age="
+                f"{alignment.merge_at_monotonic - observation_monotonic:.3f}s "
+                f"{fields}"
+            )
+        return True
 
     def _start_inference_thread(self) -> None:
         """Start the background RTC inference daemon thread."""
+        self._watchdog.started_at_monotonic = time.monotonic()
         self._inference_thread = threading.Thread(
             target=self._inference_loop,
             name="rtc-inference",
             daemon=True,
         )
         self._inference_thread.start()
+
+    def _log_rtc_pipeline_timing(
+        self,
+        *,
+        sample_id: int,
+        phase: str,
+        guided: bool,
+        publish_ready_after: bool,
+        observation_monotonic: float,
+        observation_timing: VLAObservationTiming | None,
+        dispatch: RTCDispatchSnapshot,
+        model_lock_requested_at: float,
+        model_started_at: float,
+        predict_started_at: float,
+        predict_completed_at: float,
+        postprocess_completed_at: float,
+        safety_lock_requested_at: float,
+        safety_lock_acquired_at: float,
+        commit_completed_at: float,
+        merge_timing: RTCMergeStageTiming,
+    ) -> None:
+        """Emit one non-synchronizing timing trace for a debug RTC forward."""
+        if not self._rtc_timing_enabled:
+            return
+
+        def milliseconds(end: float, start: float) -> float:
+            return (end - start) * 1000.0
+
+        def optional_milliseconds(
+            end: float | None,
+            start: float | None,
+        ) -> str:
+            if end is None or start is None:
+                return "nan"
+            return f"{milliseconds(end, start):.3f}"
+
+        if observation_timing is None:
+            observation_fields = "obs_read_ms=nan obs_validate_ms=nan obs_preprocess_ms=nan "
+            observation_fields += "source_to_ready_ms=nan ready_to_dispatch_ms=nan"
+        else:
+            observation_fields = (
+                "obs_read_ms="
+                f"{milliseconds(observation_timing.read_completed_monotonic, observation_timing.read_started_monotonic):.3f} "
+                "obs_validate_ms="
+                f"{milliseconds(observation_timing.preprocess_started_monotonic, observation_timing.read_completed_monotonic):.3f} "
+                "obs_preprocess_ms="
+                f"{milliseconds(observation_timing.ready_at_monotonic, observation_timing.preprocess_started_monotonic):.3f} "
+                "source_to_ready_ms="
+                f"{milliseconds(observation_timing.ready_at_monotonic, observation_monotonic):.3f} "
+                "ready_to_dispatch_ms="
+                f"{milliseconds(dispatch.requested_at_monotonic, observation_timing.ready_at_monotonic):.3f}"
+            )
+
+        self.get_logger().info(
+            "[RTC_TIMING] "
+            f"sample={sample_id} phase={phase} guided={str(guided).lower()} "
+            f"publish_ready_after={str(publish_ready_after).lower()} "
+            "merged="
+            f"{str(merge_timing.alignment_merge_at_monotonic is not None).lower()} "
+            f"{observation_fields} "
+            "dispatch_to_model_lock_ms="
+            f"{milliseconds(model_lock_requested_at, dispatch.requested_at_monotonic):.3f} "
+            "model_lock_wait_ms="
+            f"{milliseconds(model_started_at, model_lock_requested_at):.3f} "
+            "model_setup_ms="
+            f"{milliseconds(predict_started_at, model_started_at):.3f} "
+            "predict_ms="
+            f"{milliseconds(predict_completed_at, predict_started_at):.3f} "
+            "postprocess_ms="
+            f"{milliseconds(postprocess_completed_at, predict_completed_at):.3f} "
+            "safety_lock_wait_ms="
+            f"{milliseconds(safety_lock_acquired_at, safety_lock_requested_at):.3f} "
+            "safety_to_queue_lock_ms="
+            f"{optional_milliseconds(merge_timing.queue_lock_requested_at_monotonic, safety_lock_acquired_at)} "
+            "queue_lock_wait_ms="
+            f"{optional_milliseconds(merge_timing.queue_lock_acquired_at_monotonic, merge_timing.queue_lock_requested_at_monotonic)} "
+            "queue_merge_ms="
+            f"{optional_milliseconds(merge_timing.merge_completed_at_monotonic, merge_timing.queue_lock_acquired_at_monotonic)} "
+            "commit_total_ms="
+            f"{milliseconds(commit_completed_at, safety_lock_acquired_at):.3f} "
+            "request_to_commit_ms="
+            f"{milliseconds(commit_completed_at, dispatch.requested_at_monotonic):.3f} "
+            "request_to_merge_ms="
+            f"{optional_milliseconds(merge_timing.alignment_merge_at_monotonic, dispatch.requested_at_monotonic)} "
+            "source_age_at_commit_ms="
+            f"{milliseconds(commit_completed_at, observation_monotonic):.3f}"
+        )
+
+    def _drain_rtc_cuda_timings(self) -> None:
+        """Log completed CUDA event pairs without synchronizing the hot path."""
+        if not self._rtc_cuda_timing_enabled:
+            return
+        while self._rtc_pending_cuda_timings:
+            pending = self._rtc_pending_cuda_timings[0]
+            try:
+                if not pending.end_event.query():
+                    break
+                self._rtc_pending_cuda_timings.popleft()
+                cuda_model_ms = pending.start_event.elapsed_time(
+                    pending.end_event
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostics are non-fatal.
+                self._rtc_pending_cuda_timings.popleft()
+                self.get_logger().warn(
+                    "[RTC_CUDA_TIMING] dropped sample="
+                    f"{pending.sample_id}: {type(exc).__name__}: {exc}"
+                )
+                continue
+            self.get_logger().info(
+                "[RTC_CUDA_TIMING] "
+                f"sample={pending.sample_id} cuda_model_ms={cuda_model_ms:.3f}"
+            )
+
+    def _start_rtc_cuda_timing(self) -> tuple[object, object] | None:
+        """Create and record a CUDA event pair without affecting inference."""
+        if not self._rtc_cuda_timing_enabled:
+            return None
+        try:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        except Exception as exc:  # noqa: BLE001 - diagnostics are non-fatal.
+            self._rtc_cuda_timing_enabled = False
+            self.get_logger().warn(
+                "[RTC_CUDA_TIMING] disabled after event setup failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+        return start_event, end_event
+
+    def _finish_rtc_cuda_timing(
+        self,
+        sample_id: int,
+        event_pair: tuple[object, object] | None,
+    ) -> None:
+        """Record the end event and enqueue it for a later non-blocking query."""
+        if event_pair is None:
+            return
+        start_event, end_event = event_pair
+        try:
+            end_event.record()
+        except Exception as exc:  # noqa: BLE001 - diagnostics are non-fatal.
+            self._rtc_cuda_timing_enabled = False
+            self.get_logger().warn(
+                "[RTC_CUDA_TIMING] disabled after end event failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
+        self._rtc_pending_cuda_timings.append(
+            PendingRTCCudaTiming(
+                sample_id=sample_id,
+                start_event=start_event,
+                end_event=end_event,
+            )
+        )
 
     def _inference_loop(self) -> None:
         """Background inference thread for VLA / RTC mode.
@@ -514,62 +1897,195 @@ class LeRobotInferenceNode(Node):
         without any further processing.
         """
         while not self._inference_stop.is_set():
-            # Wait until queue is low enough to warrant a new inference
-            if self._action_queue.qsize() > self._rtc_threshold:
+            self._drain_rtc_cuda_timings()
+            if not self._evaluate_watchdog():
                 time.sleep(0.005)
                 continue
 
-            # Read latest preprocessed observation (non-blocking)
-            with self._obs_lock:
-                obs = self._latest_obs
+            # Capture observation, queue state, and safety epoch atomically with
+            # respect to a watchdog trip. Each observation sequence may launch at
+            # most one inference.
+            with self._safety_lock:
+                if not self._watchdog.publish_allowed:
+                    continue
+                dispatch_error = None
+                with self._action_queue_lock:
+                    if self._rtc_should_wait_for_refill(
+                        queue_size=self._action_queue.qsize(),
+                        queue_threshold=self._rtc_threshold,
+                        policy_ready=self._vla_policy_ready,
+                    ):
+                        should_wait = True
+                    else:
+                        should_wait = False
+                        try:
+                            dispatch, prev_actions = (
+                                self._capture_rtc_dispatch_locked()
+                            )
+                        except Exception as exc:
+                            dispatch_error = exc
+                            should_wait = True
+                if dispatch_error is not None:
+                    result = self._watchdog.trip(
+                        "RTC dispatch snapshot failed: "
+                        f"{type(dispatch_error).__name__}: {dispatch_error}",
+                        None,
+                    )
+                    self._apply_watchdog_result_locked(result)
+                if should_wait:
+                    obs_record = None
+                else:
+                    with self._obs_lock:
+                        obs_record = self._latest_obs
+                        observation_timing = getattr(
+                            self, "_latest_obs_timing", None
+                        )
+                    if obs_record is not None:
+                        obs, sequence, epoch, observation_monotonic = obs_record
+                        if (
+                            epoch != self._watchdog.epoch
+                            or sequence == self._last_inferred_observation_sequence
+                        ):
+                            obs_record = None
+                        else:
+                            self._last_inferred_observation_sequence = sequence
+                            policy_epoch = self._policy_epoch
+                            guided_latencies_snapshot = tuple(
+                                self._rtc_guided_latencies
+                            )
+                            tracked_max_latency = self._latency_tracker.max()
 
-            if obs is None:
+            if obs_record is None:
                 time.sleep(0.005)
                 continue
 
-            # Snapshot queue state before inference for delay validation
-            idx_before = self._action_queue.get_action_index()
-            prev_actions = self._action_queue.get_left_over()
+            guided = self._rtc_has_guidance(prev_actions)
+            timing_enabled = self._rtc_timing_enabled
+            sample_id = self._rtc_timing_next_sample_id
+            if timing_enabled:
+                self._rtc_timing_next_sample_id += 1
 
             # Compute inference delay from latency history
-            max_lat = self._latency_tracker.max()
-            inference_delay = (
-                math.ceil(max_lat * self.control_freq) if max_lat else self._rtc_delay_fallback
+            # Once guided stabilization starts, use the same bounded rolling
+            # window as the readiness proof. This prevents a slow provisional
+            # seed (or LatencyTracker's historical maximum) from permanently
+            # overstating RTC delay after five newer stable guided forwards.
+            inference_delay = self._rtc_inference_delay_steps(
+                guided_latencies_sec=guided_latencies_snapshot,
+                tracked_max_latency_sec=tracked_max_latency,
+                control_freq=self.control_freq,
+                fallback_steps=self._rtc_delay_fallback,
             )
 
             # Run inference — do NOT use torch.inference_mode():
             # RTCProcessor calls torch.enable_grad() internally for guidance gradients.
             # inference_mode() cannot be overridden and would silently zero all gradients.
-            t0 = time.monotonic()
+            model_lock_requested_at = time.monotonic()
             try:
-                raw = self.model.predict_action_chunk(
-                    obs,
-                    inference_delay=inference_delay,
-                    prev_chunk_left_over=prev_actions,
-                    execution_horizon=self.model.config.rtc_config.execution_horizon,
-                )
-            except Exception as e:
+                with self._model_lock:
+                    model_started_at = (
+                        time.monotonic()
+                        if timing_enabled
+                        else model_lock_requested_at
+                    )
+                    if (
+                        not self._watchdog.is_epoch_current(epoch)
+                        or policy_epoch != self._policy_epoch
+                    ):
+                        continue
+                    cuda_event_pair = self._start_rtc_cuda_timing()
+                    predict_started_at = (
+                        time.monotonic()
+                        if timing_enabled
+                        else model_started_at
+                    )
+                    raw = self.model.predict_action_chunk(
+                        obs,
+                        inference_delay=inference_delay,
+                        prev_chunk_left_over=prev_actions,
+                        execution_horizon=self.model.config.rtc_config.execution_horizon,
+                    )
+                    predict_completed_at = (
+                        time.monotonic() if timing_enabled else 0.0
+                    )
+                    self._finish_rtc_cuda_timing(sample_id, cuda_event_pair)
+
+                    # Postprocess in the inference thread. Keep it under the model
+                    # lock so an explicit rearm cannot reset processors mid-call.
+                    original = raw.squeeze(0).clone()
+                    if self.postprocessor:
+                        processed = self.postprocessor.process_action(raw.squeeze(0))
+                    else:
+                        processed = original
+                    postprocess_completed_at = time.monotonic()
+            except Exception as exc:
                 import traceback
-                self.get_logger().error(f"[RTC] predict_action_chunk failed: {e}")
+
+                self.get_logger().error(f"[RTC] predict_action_chunk failed: {exc}")
                 self.get_logger().error(traceback.format_exc())
-                time.sleep(0.005)
+                self._latch_watchdog(f"RTC inference failed: {exc}")
                 continue
 
-            elapsed = time.monotonic() - t0
-            self._latency_tracker.add(elapsed)
-            new_delay = math.ceil(elapsed * self.control_freq)
-
-            # Postprocess in inference thread (official pattern from eval_with_real_robot.py):
-            #   original = raw (for RTC guidance of the next chunk)
-            #   processed = denormalized (ready for the robot)
-            original = raw.squeeze(0).clone()
-            if self.postprocessor:
-                processed = self.postprocessor.process_action(raw.squeeze(0))
-            else:
-                processed = original
-
-            self._action_queue.merge(original, processed, new_delay, idx_before)
-            self.metrics.record_inference()
+            elapsed = postprocess_completed_at - model_lock_requested_at
+            # A stale-input trip may occur while the GPU is busy. The epoch check
+            # discards that in-flight result before it can enter the RTC queue.
+            safety_lock_requested_at = (
+                time.monotonic()
+                if timing_enabled
+                else postprocess_completed_at
+            )
+            merge_timing = RTCMergeStageTiming() if timing_enabled else None
+            with self._safety_lock:
+                safety_lock_acquired_at = (
+                    time.monotonic()
+                    if timing_enabled
+                    else safety_lock_requested_at
+                )
+                if self._vla_warmup_pending:
+                    phase = "warmup"
+                elif not guided:
+                    phase = "seed"
+                elif self._vla_policy_ready:
+                    phase = "steady"
+                else:
+                    phase = "readiness"
+                publish_ready_after = self._commit_vla_result_locked(
+                    original=original,
+                    processed=processed,
+                    dispatch=dispatch,
+                    observation_monotonic=observation_monotonic,
+                    epoch=epoch,
+                    policy_epoch=policy_epoch,
+                    elapsed=elapsed,
+                    completed_at_monotonic=time.monotonic(),
+                    guided=guided,
+                    stage_timing=merge_timing,
+                )
+                commit_completed_at = (
+                    time.monotonic()
+                    if timing_enabled
+                    else safety_lock_acquired_at
+                )
+            if timing_enabled:
+                self._log_rtc_pipeline_timing(
+                    sample_id=sample_id,
+                    phase=phase,
+                    guided=guided,
+                    publish_ready_after=publish_ready_after,
+                    observation_monotonic=observation_monotonic,
+                    observation_timing=observation_timing,
+                    dispatch=dispatch,
+                    model_lock_requested_at=model_lock_requested_at,
+                    model_started_at=model_started_at,
+                    predict_started_at=predict_started_at,
+                    predict_completed_at=predict_completed_at,
+                    postprocess_completed_at=postprocess_completed_at,
+                    safety_lock_requested_at=safety_lock_requested_at,
+                    safety_lock_acquired_at=safety_lock_acquired_at,
+                    commit_completed_at=commit_completed_at,
+                    merge_timing=merge_timing,
+                )
+            self._drain_rtc_cuda_timings()
 
     def _preprocess_vla_observation(self, observation: dict) -> dict:
         """Preprocess a raw observation for VLA models.
@@ -598,17 +2114,81 @@ class LeRobotInferenceNode(Node):
         VLA: preprocess and update shared snapshot for background inference thread.
         ACT/Diffusion: preprocess, run select_action, push result to deque.
         """
+        timing_enabled = getattr(self, "_rtc_timing_enabled", False)
+        callback_started_monotonic = (
+            time.monotonic() if timing_enabled else 0.0
+        )
         if self._shutting_down:
             return
-        observation = self.strategy.get_observation(self.camera_names)
+        if not self._evaluate_watchdog():
+            return
+        read_started_monotonic = time.monotonic() if timing_enabled else 0.0
+        try:
+            observation = self.strategy.get_observation(self.camera_names)
+        except Exception as exc:
+            self._latch_watchdog(
+                f"observation read failed: {type(exc).__name__}: {exc}",
+                snapshot=None,
+                read_snapshot=False,
+            )
+            return
+        read_completed_monotonic = time.monotonic() if timing_enabled else 0.0
         if observation is None:
             return
 
+        sequence = self.strategy.get_last_observation_sequence()
+        observation_monotonic = self.strategy.get_last_observation_monotonic()
+        try:
+            snapshot = self.strategy.get_input_snapshot(self.camera_names)
+        except Exception as exc:
+            self._latch_watchdog(
+                f"post-observation snapshot read failed: {type(exc).__name__}: {exc}",
+                snapshot=None,
+                read_snapshot=False,
+            )
+            return
+        if sequence is None or observation_monotonic is None:
+            self._latch_watchdog("strategy returned an observation without a sequence", snapshot)
+            return
+
+        with self._safety_lock:
+            watchdog_result = self._watchdog.accept_observation(sequence, snapshot)
+            self._apply_watchdog_result_locked(watchdog_result)
+            if not watchdog_result.publish_allowed:
+                return
+            inference_epoch = watchdog_result.epoch
+            policy_epoch = self._policy_epoch
+
         try:
             if self._is_vla:
+                preprocess_started_monotonic = (
+                    time.monotonic() if timing_enabled else 0.0
+                )
                 obs = self._preprocess_vla_observation(observation)
-                with self._obs_lock:
-                    self._latest_obs = obs
+                if timing_enabled:
+                    observation_timing = VLAObservationTiming(
+                        callback_started_monotonic=callback_started_monotonic,
+                        read_started_monotonic=read_started_monotonic,
+                        read_completed_monotonic=read_completed_monotonic,
+                        preprocess_started_monotonic=preprocess_started_monotonic,
+                        ready_at_monotonic=time.monotonic(),
+                    )
+                else:
+                    observation_timing = None
+                with self._safety_lock:
+                    if (
+                        not self._watchdog.is_epoch_current(inference_epoch)
+                        or policy_epoch != self._policy_epoch
+                    ):
+                        return
+                    with self._obs_lock:
+                        self._latest_obs = (
+                            obs,
+                            sequence,
+                            inference_epoch,
+                            observation_monotonic,
+                        )
+                        self._latest_obs_timing = observation_timing
             else:
                 # Keep a reference to the raw (unnormalised) observation so we can
                 # capture the joint-state baseline when a new chunk is generated.
@@ -644,18 +2224,31 @@ class LeRobotInferenceNode(Node):
                         f"[DEBUG] obs.state (post-preproc): [{', '.join(f'{v:.4f}' for v in _dbg_s)}]"
                     )
 
-                with torch.inference_mode():
-                    if _will_run_forward:
-                        _t0 = time.monotonic()
-                    action = self.model.select_action(observation)
-                    if _will_run_forward:
-                        self._latency_tracker.add(time.monotonic() - _t0)
-                    # Collect remaining normalized queue items BEFORE postprocessing so
-                    # the whole chunk can be denormalized together for delta restore.
-                    if _is_new_chunk and self.use_delta_actions and hasattr(self.model, "_queues"):
-                        _rest_norm = [a.detach().clone() for a in self.model._queues.get("action", [])]
-                    else:
-                        _rest_norm = None
+                with self._model_lock:
+                    if (
+                        not self._watchdog.is_epoch_current(inference_epoch)
+                        or policy_epoch != self._policy_epoch
+                    ):
+                        return
+                    with torch.inference_mode():
+                        if _will_run_forward:
+                            _t0 = time.monotonic()
+                        action = self.model.select_action(observation)
+                        if _will_run_forward:
+                            self._latency_tracker.add(time.monotonic() - _t0)
+                        # Collect remaining normalized queue items BEFORE postprocessing so
+                        # the whole chunk can be denormalized together for delta restore.
+                        if (
+                            _is_new_chunk
+                            and self.use_delta_actions
+                            and hasattr(self.model, "_queues")
+                        ):
+                            _rest_norm = [
+                                a.detach().clone()
+                                for a in self.model._queues.get("action", [])
+                            ]
+                        else:
+                            _rest_norm = None
 
                 # Capture reference state right after chunk generation
                 if _is_new_chunk and "observation.state" in _raw_obs:
@@ -699,14 +2292,42 @@ class LeRobotInferenceNode(Node):
                     elif not hasattr(self.model, "_queues") and self._delta_ref_state is not None:
                         action = restore_delta_chunk(action[np.newaxis], self._delta_ref_state, self.action_type, self._delta_exclude_indices)[0]
 
-                self._classic_action_deque.append(action)
-                if _will_run_forward:
-                    self.metrics.record_inference()
+                with self._safety_lock:
+                    if policy_epoch != self._policy_epoch:
+                        self.get_logger().warn(
+                            "Discarded in-flight classic-policy result from "
+                            f"policy epoch {policy_epoch}; current policy epoch "
+                            f"is {self._policy_epoch}"
+                        )
+                        return
+                    if not self._watchdog.is_epoch_current(inference_epoch):
+                        self.get_logger().warn(
+                            "Discarded in-flight classic-policy result from "
+                            f"watchdog epoch {inference_epoch}"
+                        )
+                        self._invalidate_action_state_locked()
+                        return
+                    if _will_run_forward:
+                        self._classic_chunk_source_monotonic = observation_monotonic
+                    action_source = self._classic_chunk_source_monotonic
+                    if action_source is None:
+                        result = self._watchdog.trip(
+                            "classic policy produced an action without a source observation",
+                            snapshot,
+                        )
+                        self._apply_watchdog_result_locked(result)
+                        return
+                    self._classic_action_deque.append(
+                        (action, action_source, inference_epoch)
+                    )
+                    if _will_run_forward:
+                        self.metrics.record_inference()
 
         except Exception as e:
             import traceback
             self.get_logger().error(f"Observation/inference error: {e}")
             self.get_logger().error(traceback.format_exc())
+            self._latch_watchdog(f"observation/inference failed: {e}")
 
     def _publish_loop(self) -> None:
         """Action publish timer (unified for all models).
@@ -716,30 +2337,76 @@ class LeRobotInferenceNode(Node):
         """
         if self._shutting_down:
             return
+        if not self._evaluate_watchdog():
+            return
         self.metrics.record_control_loop()
 
-        if self._is_vla:
-            action = self._action_queue.get()
-            if self._debug:
-                self._queue_depths.append(self._action_queue.qsize())
-            if action is None:
-                self._vla_skip_count += 1
+        # Keep the safety lock through the final ROS publish. A concurrent fault
+        # transition therefore either happens first (and clears the queue) or
+        # waits until this already-authorized publish has completed.
+        with self._safety_lock:
+            if not self._watchdog.publish_allowed:
                 return
-            if isinstance(action, torch.Tensor):
-                if action.dim() > 1:
-                    action = action.squeeze(0)
-                action = action.cpu().numpy()
-        else:
-            if not self._classic_action_deque:
-                return
-            action = self._classic_action_deque.popleft()
 
-        try:
-            self._publish_action(action)
-        except Exception as e:
-            import traceback
-            self.get_logger().error(f"Publish error: {e}")
-            self.get_logger().error(traceback.format_exc())
+            if self._is_vla:
+                # Input health (ARMED) and policy readiness are deliberately
+                # separate. No warm-up or stale pre-ready result can be popped,
+                # authorized, or published.
+                if not self._vla_policy_ready:
+                    return
+                with self._action_queue_lock:
+                    action = self._action_queue.get()
+                    queue_size = self._action_queue.qsize()
+                    action_source = self._vla_action_source_monotonic
+                    action_epoch = self._vla_action_epoch
+                if self._debug:
+                    self._queue_depths.append(queue_size)
+                if action is None:
+                    self._vla_skip_count += 1
+                    result = self._watchdog.trip(
+                        "RTC action queue emptied after POLICY_READY",
+                        None,
+                    )
+                    self._apply_watchdog_result_locked(result)
+                    return
+                if isinstance(action, torch.Tensor):
+                    if action.dim() > 1:
+                        action = action.squeeze(0)
+                    action = action.cpu().numpy()
+            else:
+                if not self._classic_action_deque:
+                    return
+                action, action_source, action_epoch = self._classic_action_deque.popleft()
+
+            try:
+                snapshot = self.strategy.get_input_snapshot(self.camera_names)
+            except Exception as exc:
+                result = self._watchdog.trip(
+                    f"action authorization snapshot read failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    None,
+                )
+                self._apply_watchdog_result_locked(result)
+                return
+
+            result = self._watchdog.authorize_action(
+                epoch=action_epoch,
+                source_monotonic=action_source,
+                now=time.monotonic(),
+                snapshot=snapshot,
+            )
+            self._apply_watchdog_result_locked(result)
+            if not result.publish_allowed:
+                return
+
+            try:
+                self._publish_action(action)
+            except Exception as e:
+                import traceback
+
+                self.get_logger().error(f"Publish error: {e}")
+                self.get_logger().error(traceback.format_exc())
+                self._latch_watchdog(f"action publication failed: {e}")
 
     def _reset_delta_state(self) -> None:
         """Reset delta-restore state; call this whenever the model is reloaded."""
@@ -767,8 +2434,40 @@ class LeRobotInferenceNode(Node):
         return data
 
     def _publish_action(self, action: np.ndarray) -> None:
-        """Publish action to arm controllers."""
+        """Validate every arm, then publish the complete command set.
+
+        Validation is intentionally transactional: no arm publisher is touched
+        until every target has passed shape, finite-value, current-state, delta,
+        and absolute-position checks.
+        """
+        action = np.asarray(action, dtype=np.float64).reshape(-1)
+        expected_action_dim = max(
+            (arm.get("action_end", 0) for arm in self.arms_config.values()),
+            default=0,
+        )
+        if len(action) != expected_action_dim:
+            raise ValueError(
+                f"invalid action dimension: got {len(action)}, expected {expected_action_dim}"
+            )
+        if not np.all(np.isfinite(action)):
+            bad = np.flatnonzero(~np.isfinite(action)).tolist()
+            raise ValueError(f"action contains non-finite values at indices {bad}")
+
+        covered_indices: list[int] = []
+        for arm_name, arm_config in self.arms_config.items():
+            start = int(arm_config.get("action_start", 0))
+            end = int(arm_config.get("action_end", 0))
+            if start < 0 or end <= start or end > expected_action_dim:
+                raise ValueError(
+                    f"invalid action slice for arm {arm_name}: [{start}:{end}]"
+                )
+            covered_indices.extend(range(start, end))
+        if sorted(covered_indices) != list(range(expected_action_dim)):
+            raise ValueError("arm action slices must exactly cover each output index once")
+
         current_positions = self.strategy.get_current_joint_positions()
+        if not current_positions:
+            raise ValueError("current joint positions unavailable at publish time")
         joint_order = self.joint_names_config.get(
             "controller_joint_order",
             self.joint_names_config.get("joint_order", []),
@@ -776,26 +2475,50 @@ class LeRobotInferenceNode(Node):
 
         monitor_obs_parts: list[np.ndarray] = []
         monitor_cmd_parts: list[np.ndarray] = []
+        pending_messages: list[tuple[str, Float64MultiArray]] = []
+        processed_full = np.empty_like(action)
 
         for arm_name, arm_config in self.arms_config.items():
             start_idx = arm_config.get("action_start", 0)
             end_idx = arm_config.get("action_end", len(action))
             ros_prefix = arm_config.get("ros_prefix", arm_name)
 
-            arm_action = action[start_idx:end_idx].copy()
+            model_order_action = action[start_idx:end_idx].copy()
 
-            arm_current = None
-            if current_positions:
-                arm_current = np.array(
-                    [
-                        current_positions.get(f"{ros_prefix}_{joint_order[i]}", 0.0)
-                        for i in range(len(arm_action))
-                    ]
-                )
+            current_names = [
+                f"{ros_prefix}_{joint_order[i]}" for i in range(len(model_order_action))
+            ]
+            missing = [name for name in current_names if name not in current_positions]
+            if missing:
+                raise ValueError("joint positions missing at publish time: " + ", ".join(missing))
+            arm_current = np.array([current_positions[name] for name in current_names])
+            if not np.all(np.isfinite(arm_current)):
+                raise ValueError(f"current joint positions are non-finite for arm {arm_name}")
 
-            # Delta restore is done upstream in _obs_update (chunk-level).
-            # Actions arriving here are already absolute — just apply safety limits.
-            arm_action = self.action_limiter.process(arm_action, arm_current)
+            # Delta restore is done upstream in _obs_update (chunk-level), so the
+            # raw model target is already absolute. Validate it in controller
+            # order *before* delta limiting: otherwise an impossible target can
+            # be hidden by a small per-cycle clamp and walk the robot toward the
+            # invalid target over repeated cycles.
+            raw_controller_action = self.action_limiter.reorder(model_order_action)
+            raw_controller_action = self._validate_absolute_joint_targets(
+                current_names,
+                raw_controller_action,
+                stage="raw absolute",
+            )
+
+            arm_action = self.action_limiter.process_controller_order(
+                raw_controller_action,
+                arm_current,
+            )
+            if not np.all(np.isfinite(arm_action)):
+                raise ValueError(f"processed action is non-finite for arm {arm_name}")
+            arm_action = self._validate_absolute_joint_targets(
+                current_names,
+                arm_action,
+                stage="final command",
+            )
+            processed_full[start_idx:end_idx] = arm_action
 
             if self._debug:
                 formatted = ", ".join(f"{v:.4f}" for v in arm_action)
@@ -803,26 +2526,64 @@ class LeRobotInferenceNode(Node):
 
             msg = Float64MultiArray()
             msg.data = arm_action.tolist()
-            if arm_name in self.arm_publishers:
-                self.arm_publishers[arm_name].publish(msg)
+            if arm_name not in self.arm_publishers:
+                raise ValueError(f"action publisher missing for arm {arm_name}")
+            pending_messages.append((arm_name, msg))
 
             if self._monitor_enable:
                 if arm_current is not None:
                     monitor_obs_parts.append(arm_current)
                 monitor_cmd_parts.append(arm_action)
 
+        # Only publish after every arm passed every check above.
+        for arm_name, msg in pending_messages:
+            self.arm_publishers[arm_name].publish(msg)
+
         if self._monitor_enable and monitor_cmd_parts:
             self._publish_monitor(
                 obs_state=np.concatenate(monitor_obs_parts) if monitor_obs_parts else np.zeros_like(action),
                 raw_output=action,
-                control_cmd=np.concatenate(monitor_cmd_parts),
+                control_cmd=processed_full,
             )
 
         # Debug: track smoothness
         if self._smooth_tracker is not None:
-            self._smooth_tracker.record(action)
+            self._smooth_tracker.record(processed_full)
         self.metrics.record_action_output()
         self._has_published = True
+
+    def _validate_absolute_joint_targets(
+        self,
+        joint_names: list[str],
+        targets: np.ndarray,
+        *,
+        stage: str,
+    ) -> np.ndarray:
+        """Reject out-of-range targets and clip numerical tolerance to the bound."""
+        targets = np.asarray(targets, dtype=np.float64).reshape(-1).copy()
+        if len(targets) != len(joint_names):
+            raise ValueError(
+                f"{stage} target dimension mismatch: "
+                f"got {len(targets)}, expected {len(joint_names)}"
+            )
+        if not np.all(np.isfinite(targets)):
+            raise ValueError(f"{stage} joint target is non-finite")
+
+        for index, (joint_name, target) in enumerate(
+            zip(joint_names, targets, strict=True)
+        ):
+            lower, upper = self._joint_position_limits[joint_name]
+            if (
+                target < lower - self._joint_limit_tolerance
+                or target > upper + self._joint_limit_tolerance
+            ):
+                raise ValueError(
+                    f"{stage} joint target outside absolute limit: "
+                    f"{joint_name}={target:.9f}, "
+                    f"allowed=[{lower:.9f}, {upper:.9f}]"
+                )
+            targets[index] = float(np.clip(target, lower, upper))
+        return targets
 
     def _publish_monitor(
         self,
@@ -850,7 +2611,15 @@ class LeRobotInferenceNode(Node):
             return  # Wait for enough data
 
         # Get frame counters from shared memory workers
-        frame_counters: dict[str, int] = self.strategy.get_frame_counters() or {}
+        try:
+            frame_counters: dict[str, int] = self.strategy.get_frame_counters() or {}
+        except Exception as exc:
+            self._latch_watchdog(
+                f"camera counter snapshot read failed: {type(exc).__name__}: {exc}",
+                snapshot=None,
+                read_snapshot=False,
+            )
+            return
 
         # Compute windowed rates (delta since last log)
         now = time.time()
@@ -922,7 +2691,7 @@ class LeRobotInferenceNode(Node):
                     f"std={lat_std * 1000:.1f}ms  p95={lat_p95 * 1000:.1f}ms"
                 )
 
-    def _log_stats_vla(self, logger, dt, stats, inference_hz, action_output_hz, bottleneck_name, camera_hz) -> None:
+    def _log_stats_vla(self, logger, _dt, stats, inference_hz, action_output_hz, bottleneck_name, camera_hz) -> None:
         """Log VLA (RTC) specific stats."""
         self._log_stats_common(logger, inference_hz, action_output_hz, stats)
 
@@ -964,7 +2733,7 @@ class LeRobotInferenceNode(Node):
                 f" (threshold: {exp * 2 / 3:.0f} Hz, expected: {exp:.0f} Hz)"
             )
 
-    def _log_stats_classic(self, logger, dt, stats, control_hz, inference_hz, action_output_hz, bottleneck_name, camera_hz) -> None:
+    def _log_stats_classic(self, logger, _dt, stats, _control_hz, inference_hz, action_output_hz, bottleneck_name, camera_hz) -> None:
         """Log non-VLA (ACT/Diffusion) stats."""
         self._log_stats_common(logger, inference_hz, action_output_hz, stats)
 
@@ -989,15 +2758,14 @@ class LeRobotInferenceNode(Node):
         if not hasattr(self, "model"):
             return
         self.get_logger().info("Resetting policy state...")
-        if hasattr(self.model, "reset"):
-            self.model.reset()
-        if self._is_vla and hasattr(self, "_action_queue"):
-            from lerobot.policies.rtc.action_queue import ActionQueue
-            self._action_queue = ActionQueue(self.model.config.rtc_config)
-            with self._obs_lock:
-                self._latest_obs = None
-        if hasattr(self, "_latency_tracker"):
-            self._latency_tracker.reset()
+        with self._safety_lock:
+            self._invalidate_action_state_locked()
+            # Keep safety publication/commit exclusion in force until the model
+            # reset completes. An older forward may finish before this acquires
+            # the model lock, but its captured policy epoch can no longer commit.
+            with self._model_lock:
+                if hasattr(self.model, "reset"):
+                    self.model.reset()
         self.get_logger().info("Policy state reset complete")
 
     def get_input_stats(self) -> dict:
@@ -1019,8 +2787,20 @@ class LeRobotInferenceNode(Node):
             ros_prefix = arm_config.get("ros_prefix", arm_name)
             start_idx = arm_config.get("action_start", 0)
             end_idx = arm_config.get("action_end", len(joint_order))
-            arm_joints = joint_order[start_idx:end_idx]
-            positions = [current.get(f"{ros_prefix}_{j}", 0.0) for j in arm_joints]
+            arm_dim = end_idx - start_idx
+            arm_joints = joint_order[:arm_dim]
+            names = [f"{ros_prefix}_{joint}" for joint in arm_joints]
+            if len(names) != arm_dim or any(name not in current for name in names):
+                self.get_logger().error(
+                    f"Shutdown: cannot hold {arm_name}; current joint state is incomplete"
+                )
+                continue
+            positions = [current[name] for name in names]
+            if not np.all(np.isfinite(positions)):
+                self.get_logger().error(
+                    f"Shutdown: cannot hold {arm_name}; current joint state is non-finite"
+                )
+                continue
             msg = Float64MultiArray()
             msg.data = positions
             if arm_name in self.arm_publishers:
@@ -1047,7 +2827,11 @@ class LeRobotInferenceNode(Node):
 
         # Hold position before publisher is torn down — only if we actually
         # commanded the robot at least once during this session.
-        if not self.echo_topic_only and self._has_published:
+        if (
+            not self.echo_topic_only
+            and self._has_published
+            and self._evaluate_watchdog()
+        ):
             self._publish_hold_position()
 
         self.strategy.cleanup()

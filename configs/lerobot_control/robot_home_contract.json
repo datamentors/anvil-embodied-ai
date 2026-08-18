@@ -1,0 +1,29 @@
+{
+  "reset_service": "/arms_resetter/reset",
+  "reset_status_topic": "/arms_resetter/reset_status",
+  "joint_state_topic": "/joint_states",
+  "success_status": "homed",
+  "failure_status_keywords": ["abort", "error", "fail", "timeout"],
+  "service_wait_timeout_sec": 15.0,
+  "overall_timeout_sec": 60.0,
+  "settle_duration_sec": 1.0,
+  "minimum_settle_samples": 100,
+  "joints": [
+    {"name": "follower_l_joint1", "target": 0.0, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_l_joint2", "target": -0.174, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_l_joint3", "target": 0.0, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_l_joint4", "target": 1.5708, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_l_joint5", "target": 0.0, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_l_joint6", "target": 0.0, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_l_joint7", "target": 0.0, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_l_finger_joint1", "target": 0.045, "position_tolerance": 0.006, "velocity_tolerance": 0.02},
+    {"name": "follower_r_joint1", "target": 0.0, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_r_joint2", "target": 0.174, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_r_joint3", "target": 0.0, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_r_joint4", "target": 1.5708, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_r_joint5", "target": 0.0, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_r_joint6", "target": 0.0, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_r_joint7", "target": 0.0, "position_tolerance": 0.08, "velocity_tolerance": 0.05},
+    {"name": "follower_r_finger_joint1", "target": 0.045, "position_tolerance": 0.006, "velocity_tolerance": 0.02}
+  ]
+}
