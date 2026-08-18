@@ -1084,8 +1084,9 @@ class LeRobotInferenceNode(Node):
 
         ``runtime_sec`` starts when the leftover and queue index are captured
         and ends immediately before merge. Once publication is open, real queue
-        consumption is the authoritative merge delay; the wall clock only
-        checks that consumption is plausible within one configured phase step.
+        consumption is the authoritative merge delay. The wall clock provides
+        an upper bound: the timer may be delayed by executor scheduling, but it
+        must not consume more actions than the elapsed time can explain.
         Before readiness, publication is closed by design, so consumption must
         be zero and the conservative wall delay is used virtually.
         """
@@ -1144,17 +1145,14 @@ class LeRobotInferenceNode(Node):
             if queue_size_at_merge < 1:
                 raise ValueError("RTC action queue emptied before refill merge")
             phase_steps = runtime_sec * control_freq
-            minimum_consumed = (
-                math.floor(phase_steps) - index_phase_tolerance_steps
-            )
             maximum_consumed = (
                 math.ceil(phase_steps) + index_phase_tolerance_steps
             )
-            if not minimum_consumed <= consumed_steps <= maximum_consumed:
+            if consumed_steps > maximum_consumed:
                 raise ValueError(
-                    "RTC queue consumption outside wall-clock phase bounds: "
-                    f"consumed={consumed_steps}, expected=[{minimum_consumed},"
-                    f"{maximum_consumed}], runtime={runtime_sec:.6f}s"
+                    "RTC queue consumption exceeds wall-clock upper bound: "
+                    f"consumed={consumed_steps}, maximum={maximum_consumed}, "
+                    f"runtime={runtime_sec:.6f}s"
                 )
             merge_delay_steps = consumed_steps
 

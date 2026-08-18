@@ -662,14 +662,33 @@ def test_rtc_merge_alignment_uses_real_consumption_within_phase_bound() -> None:
     assert alignment.merge_delay_steps == 16
 
 
-def test_rtc_merge_alignment_rejects_consumption_outside_guard() -> None:
-    with pytest.raises(ValueError, match="outside wall-clock phase bounds"):
+def test_rtc_merge_alignment_accepts_scheduler_delayed_consumption() -> None:
+    alignment = LeRobotInferenceNode._resolve_rtc_merge_alignment(
+        queue_identity_matches=True,
+        queue_size_before_inference=35,
+        queue_size_at_merge=25,
+        action_index_before_inference=4,
+        action_index_at_merge=14,
+        requested_at_monotonic=10.0,
+        merge_at_monotonic=10.467536,
+        control_freq=30.0,
+        policy_ready=True,
+        index_phase_tolerance_steps=1,
+    )
+
+    assert alignment.wall_delay_steps == 15
+    assert alignment.consumed_steps == 10
+    assert alignment.merge_delay_steps == 10
+
+
+def test_rtc_merge_alignment_rejects_consumption_above_upper_guard() -> None:
+    with pytest.raises(ValueError, match="exceeds wall-clock upper bound"):
         LeRobotInferenceNode._resolve_rtc_merge_alignment(
             queue_identity_matches=True,
             queue_size_before_inference=35,
-            queue_size_at_merge=23,
+            queue_size_at_merge=18,
             action_index_before_inference=4,
-            action_index_at_merge=16,
+            action_index_at_merge=21,
             requested_at_monotonic=10.0,
             merge_at_monotonic=10.5,
             control_freq=30.0,
@@ -985,7 +1004,7 @@ def test_post_ready_merge_uses_real_consumption_when_it_exceeds_wall_delay() -> 
     assert node._action_queue.qsize() == 34
 
 
-def test_post_ready_consumption_mismatch_latches_before_merge() -> None:
+def test_post_ready_excess_consumption_latches_before_merge() -> None:
     node = make_vla_result_node()
     node._vla_warmup_pending = False
     node._vla_policy_ready = True
@@ -1000,7 +1019,7 @@ def test_post_ready_consumption_mismatch_latches_before_merge() -> None:
         action_index=old_queue.get_action_index(),
         requested_at_monotonic=10.0,
     )
-    for _ in range(12):
+    for _ in range(17):
         assert old_queue.get() is not None
 
     assert not commit_vla_result(
@@ -1015,7 +1034,7 @@ def test_post_ready_consumption_mismatch_latches_before_merge() -> None:
     assert old_queue.merge_calls == []
     assert node._watchdog.latched is True
     assert node._watchdog.publish_allowed is False
-    assert "outside wall-clock phase bounds" in node._watchdog.trip_reason
+    assert "exceeds wall-clock upper bound" in node._watchdog.trip_reason
     assert node._vla_policy_ready is False
     assert node._action_queue.qsize() == 0
 

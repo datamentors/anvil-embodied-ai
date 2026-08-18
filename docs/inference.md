@@ -215,14 +215,16 @@ and time `t0`. Immediately before merge under the same lock it captures `q1`,
 ```text
 pre-ready:  i1-i0 = 0; D_merge = ceil(f * L)
 post-ready: D_idx = i1-i0 = q0-q1
-            floor(f * L)-P <= D_idx <= ceil(f * L)+P
+            0 <= D_idx <= ceil(f * L)+P
             q1 >= 1; D_merge = D_idx
 ```
 
-Queue identity, index, depth, leftover length, or phase disagreement is a
-fail-closed rejection. The post-ready queue index is authoritative because it
-is aligned with the exact leftover passed to RTC. Source observation age is not
-used as a merge delay; it remains the independent freshness/provenance clock.
+Queue identity, index, depth, leftover length, or consumption above the
+wall-clock upper bound is a fail-closed rejection. Consumption may be below the
+wall estimate when the ROS executor delays the publish timer; in that case the
+exact queue index remains authoritative because it is aligned with the leftover
+passed to RTC. Source observation age is not used as a merge delay; it remains
+the independent freshness/provenance clock.
 
 For chunk length `C`, control frequency `f`, queue threshold `T`, exact source
 age at merge `A`, action-age limit `M`, execution horizon `H`, latency guard
