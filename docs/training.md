@@ -559,6 +559,25 @@ the real run. `EPOCHS` defaults to 5; paths, task description, output root and
 offline Hugging Face cache can be overridden through the environment variables
 listed by `scripts/run_pi05_multigpu.sh --help`.
 
+Set `CHECKPOINT_FREQ` to override the default midpoint/final checkpoint cadence.
+Validation and test evaluation are capped at 100 batches by default, sampled
+uniformly across each split instead of taking only its first frames. Override
+the cap with `ANVIL_EVAL_MAX_BATCHES`; set it to `0` only when a full-split
+evaluation is intentionally required.
+For long runs on a workstation with a mounted NAS, archive completed checkpoints
+in a separate process:
+
+```bash
+scripts/archive_training_checkpoints.sh \
+  /path/to/local/run-root/runs \
+  /path/to/NAS/checkpoints
+```
+
+The archiver waits for `training_state/training_step.json`, copies to a partial
+directory, verifies every file with checksums, and atomically publishes the NAS
+copy. It retains the latest completed checkpoint locally for resume and removes
+only older checkpoints that have a verified `ARCHIVE_COMPLETE` marker.
+
 ---
 
 ## Outputs

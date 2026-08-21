@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,19 @@ log = logging.getLogger(__name__)
 # Sentinel used to mark "patch already installed" in the originals list so we
 # can keep insertion order + detect re-entrancy without wrapping in tuples.
 _PATCHED_MARKER = object()
+
+
+def evenly_spaced_sample_indices(total: int, limit: int) -> list[int]:
+    """Return up to ``limit`` deterministic indices spanning ``total`` samples."""
+    if total < 0:
+        raise ValueError("total must be non-negative")
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    if total <= limit:
+        return list(range(total))
+    if limit == 1:
+        return [0]
+    return [index * (total - 1) // (limit - 1) for index in range(limit)]
 
 
 class TransformRunner:
@@ -412,6 +426,12 @@ class TransformRunner:
 
         val_state = self
         _patched = {"done": False}
+        try:
+            eval_max_batches = int(os.environ.get("ANVIL_EVAL_MAX_BATCHES", "0"))
+        except ValueError as exc:
+            raise ValueError("ANVIL_EVAL_MAX_BATCHES must be a non-negative integer") from exc
+        if eval_max_batches < 0:
+            raise ValueError("ANVIL_EVAL_MAX_BATCHES must be a non-negative integer")
 
         def patched_make_dataset(cfg):
             # Only intercept the first call (main process dataset creation).
@@ -498,9 +518,21 @@ class TransformRunner:
             }
             split_kind = "curated" if loaded_split is not None else "randomly selected"
 
-            def _make_dataloader(dataset):
+            def _make_dataloader(dataset, split_name):
+                eval_dataset = dataset
+                max_samples = eval_max_batches * cfg.batch_size
+                if max_samples and len(dataset) > max_samples:
+                    indices = evenly_spaced_sample_indices(len(dataset), max_samples)
+                    eval_dataset = torch.utils.data.Subset(dataset, indices)
+                    log.info(
+                        "[eval] %s sampled %d / %d frames uniformly (%d batches max)",
+                        split_name,
+                        len(indices),
+                        len(dataset),
+                        eval_max_batches,
+                    )
                 return torch.utils.data.DataLoader(
-                    dataset,
+                    eval_dataset,
                     batch_size=cfg.batch_size,
                     shuffle=False,
                     sampler=None,
@@ -514,7 +546,7 @@ class TransformRunner:
             if val_ep:
                 cfg.dataset.episodes = val_ep
                 val_dataset = original_make_dataset(cfg)
-                val_state._val_dataloader = _make_dataloader(val_dataset)
+                val_state._val_dataloader = _make_dataloader(val_dataset, "validation")
                 log.info(
                     "[split] val=%d ep (%s, %d frames)",
                     len(val_ep),
@@ -526,7 +558,7 @@ class TransformRunner:
             if test_ep:
                 cfg.dataset.episodes = test_ep
                 test_dataset = original_make_dataset(cfg)
-                val_state._test_dataloader = _make_dataloader(test_dataset)
+                val_state._test_dataloader = _make_dataloader(test_dataset, "test")
                 log.info(
                     "[split] test=%d ep (%s, %d frames)",
                     len(test_ep),

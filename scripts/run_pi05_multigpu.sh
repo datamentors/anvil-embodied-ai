@@ -20,6 +20,8 @@ Optional environment variables:
   CUDA_DEVICES=0,1,2,3
   BATCH_PER_GPU=16
   EPOCHS=5
+  CHECKPOINT_FREQ=<steps; defaults to midpoint and final>
+  ANVIL_EVAL_MAX_BATCHES=100
   PROBE_FULL_VLM=1
   PREFLIGHT_ONLY=0
   SMOKE_TEST=0
@@ -66,6 +68,7 @@ CUDA_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
 MAIN_PORT="${MAIN_PORT:-${DEFAULT_MAIN_PORT}}"
 
 EPOCHS="${EPOCHS:-5}"
+CHECKPOINT_FREQ="${CHECKPOINT_FREQ:-}"
 BATCH_PER_GPU="${BATCH_PER_GPU:-16}"
 IFS=',' read -r -a GPU_IDS <<<"${CUDA_DEVICES}"
 WORLD_SIZE="${#GPU_IDS[@]}"
@@ -105,7 +108,11 @@ export TRANSFORMERS_OFFLINE=1
 export PYTHONDONTWRITEBYTECODE=1
 export TOKENIZERS_PARALLELISM=false
 export DDP_TIMEOUT_MIN=30
-export ANVIL_EVAL_MAX_BATCHES="${ANVIL_EVAL_MAX_BATCHES:-500}"
+export ANVIL_EVAL_MAX_BATCHES="${ANVIL_EVAL_MAX_BATCHES:-100}"
+if ! [[ "${ANVIL_EVAL_MAX_BATCHES}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: ANVIL_EVAL_MAX_BATCHES must be a non-negative integer" >&2
+  exit 2
+fi
 export NCCL_DEBUG=WARN
 
 export WANDB_DIR="${RUN_ROOT}/wandb"
@@ -218,6 +225,14 @@ PY
 fi
 eval "${metadata_exports}"
 
+if [[ -n "${CHECKPOINT_FREQ}" ]]; then
+  if ! [[ "${CHECKPOINT_FREQ}" =~ ^[1-9][0-9]*$ ]] || ((CHECKPOINT_FREQ > STEPS)); then
+    echo "ERROR: CHECKPOINT_FREQ must be a positive integer no greater than ${STEPS}" >&2
+    exit 2
+  fi
+  SAVE_FREQ="${CHECKPOINT_FREQ}"
+fi
+
 TASK="${TASK_DESCRIPTION:-${MANIFEST_TASK:-${DATASET_TASK}}}"
 if [[ -z "${TASK}" ]]; then
   echo "ERROR: TRAIN_READY.json does not contain one unique prompt; set TASK_DESCRIPTION" >&2
@@ -236,6 +251,8 @@ printf '%s\n' \
   "AFO lookahead: ${AFO_LOOKAHEAD_FRAMES} frames" \
   "Epochs: ${EPOCHS}" \
   "Steps: ${STEPS_PER_EPOCH}/epoch, ${STEPS} total" \
+  "Checkpoint frequency: every ${SAVE_FREQ} steps" \
+  "Evaluation: at most ${ANVIL_EVAL_MAX_BATCHES} batches per split, uniformly sampled" \
   "Batch: ${BATCH_PER_GPU}/GPU x ${WORLD_SIZE} = ${GLOBAL_BATCH_SIZE}" \
   "Learning rate: ${LEARNING_RATE}"
 
@@ -301,6 +318,8 @@ run_training() {
     "world_size=${WORLD_SIZE}" \
     "global_batch_size=${GLOBAL_BATCH_SIZE}" \
     "steps=${run_steps}" \
+    "save_freq=${save_freq}" \
+    "eval_max_batches=${ANVIL_EVAL_MAX_BATCHES}" \
     "seed=${SEED}" \
     "started_utc=$(date -u +%FT%TZ)" \
     > "${run_dir}/RUN_CONFIG.txt"
