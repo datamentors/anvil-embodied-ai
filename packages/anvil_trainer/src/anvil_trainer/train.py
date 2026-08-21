@@ -205,6 +205,11 @@ Anvil-specific flags (stripped before passing to LeRobot):
       Test loss logged every save_freq steps (eval/test_loss).
       Set to --split-ratio=1,0,0 to disable held-out sets.
 
+  --split-manifest=PATH
+      Load explicit curated train_episodes, val_episodes and test_episodes from
+      a JSON manifest. Lists must be disjoint source-dataset episode indices.
+      This takes precedence over --split-ratio and --max-episodes.
+
   --job_name=NAME
       Human-readable run name. Checkpoints saved to model_zoo/<name>/.
       Auto-generated from policy type + timestamp if omitted.

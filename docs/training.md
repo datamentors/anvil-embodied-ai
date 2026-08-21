@@ -507,11 +507,30 @@ but does not exercise Pi0.5's default quantile contract.
 
 #### Multi-GPU Pi0.5 launcher
 
+For the envelope task, generate an immutable curated manifest before launching
+training. The curation combines objective trajectory checks with the automated
+visual consensus labels, defers ambiguous episodes, preserves supported
+right-arm trajectories, and keeps continuous source-video groups in exactly
+one split:
+
+```bash
+python scripts/curate_envelope_dataset.py \
+  --episodes-json=/path/to/analysis/episodes.json \
+  --labels-csv=/path/to/analysis/auto-labels/final/derived-auto-labels.csv \
+  --train-ready-json=/path/to/dataset/TRAIN_READY.json \
+  --output-dir=/path/to/analysis/curated-v1
+```
+
+This command does not copy or modify the LeRobot dataset. It writes
+`episode-decisions.jsonl`, `curation-summary.json`, and `split_info.json`.
+
 `scripts/run_pi05_multigpu.sh` provides the reviewed recipe for a train-ready
-local dataset. It requires `TRAIN_READY.json`, reads the AFO contract and unique
-task prompt from that marker, derives optimizer steps from the deterministic
-8:1:1 episode split, and starts from `lerobot/pi05_base` with absolute actions
-and exact quantile normalization. It defaults to four GPUs and batch 16 per
+local dataset. It requires `TRAIN_READY.json`, reads the AFO contract and task
+prompt, and starts from `lerobot/pi05_base` with absolute actions and exact
+quantile normalization. By default it uses a deterministic random 8:1:1 split.
+Set `SPLIT_MANIFEST` to use explicit curated train/validation/test episode lists;
+optimizer steps are then derived from the selected training frames and the task
+prompt may be read from that manifest. It defaults to four GPUs and batch 16 per
 GPU, but both are explicit environment settings. It refuses to start when
 another GPU process is present or there is insufficient checkpoint space.
 
@@ -520,6 +539,7 @@ Run its non-mutating preflight first:
 ```bash
 DATASET_ROOT=/absolute/path/to/trainready-dataset \
 HF_CACHE=/absolute/path/to/huggingface-cache \
+SPLIT_MANIFEST=/absolute/path/to/curated/split_info.json \
 PREFLIGHT_ONLY=1 \
 scripts/run_pi05_multigpu.sh full_vlm
 ```
@@ -529,6 +549,7 @@ Then start the full-VLM fine-tune:
 ```bash
 DATASET_ROOT=/absolute/path/to/trainready-dataset \
 HF_CACHE=/absolute/path/to/huggingface-cache \
+SPLIT_MANIFEST=/absolute/path/to/curated/split_info.json \
 scripts/run_pi05_multigpu.sh full_vlm
 ```
 

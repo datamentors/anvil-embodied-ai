@@ -13,6 +13,7 @@ Usage:
 
 Optional environment variables:
   TASK_DESCRIPTION=<override unique prompt from TRAIN_READY.json>
+  SPLIT_MANIFEST=/absolute/path/to/curated/split_info.json
   ANVIL_TRAIN_SOURCE=<repo root; defaults to this checkout>
   VENV=<venv path; defaults to $ANVIL_TRAIN_SOURCE/.venv>
   RUN_ROOT=<output root; defaults to $ANVIL_TRAIN_SOURCE/runs/pi05>
@@ -32,6 +33,7 @@ fi
 
 MODE="${1:-}"
 DATASET_ROOT="${DATASET_ROOT:-}"
+SPLIT_MANIFEST="${SPLIT_MANIFEST:-}"
 
 if [[ -z "${DATASET_ROOT}" || -z "${MODE}" ]]; then
   usage >&2
@@ -91,6 +93,9 @@ test -x "${VENV}/bin/accelerate"
 test -x "${VENV}/bin/anvil-trainer"
 test -f "${SOURCE}/scripts/_ddp_shim/sitecustomize.py"
 test -d "${HF_CACHE}"
+if [[ -n "${SPLIT_MANIFEST}" ]]; then
+  test -f "${SPLIT_MANIFEST}"
+fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
 export HF_HOME="${HF_CACHE}"
@@ -121,7 +126,7 @@ mkdir -p \
 # Reproduce the trainer's deterministic 8:1:1 episode split and derive the
 # number of optimizer steps from the actual train frames and global batch.
 if ! metadata_exports="$("${VENV}/bin/python" - \
-  "${DATASET_ROOT}" "${EPOCHS}" "${GLOBAL_BATCH_SIZE}" "${SEED}" <<'PY'
+  "${DATASET_ROOT}" "${EPOCHS}" "${GLOBAL_BATCH_SIZE}" "${SEED}" "${SPLIT_MANIFEST}" <<'PY'
 import json
 import math
 import random
@@ -135,6 +140,7 @@ root = Path(sys.argv[1])
 epochs = int(sys.argv[2])
 global_batch_size = int(sys.argv[3])
 seed = int(sys.argv[4])
+split_manifest_path = Path(sys.argv[5]) if sys.argv[5] else None
 marker = json.loads((root / "TRAIN_READY.json").read_text())
 facts = marker["facts"]
 if facts["action_type"] != "absolute":
@@ -157,13 +163,33 @@ episode_ids = sorted(lengths)
 if episode_ids != list(range(len(episode_ids))):
     raise RuntimeError("episode_index must be contiguous from 0 to N-1")
 
-shuffled = episode_ids.copy()
-random.Random(seed).shuffle(shuffled)
-total_episodes = len(shuffled)
-n_test = round(total_episodes * 0.1)
-n_val = round(total_episodes * 0.1)
-n_train = total_episodes - n_val - n_test
-train_episodes = sorted(shuffled[:n_train])
+total_episodes = len(episode_ids)
+manifest_task = ""
+if split_manifest_path is not None:
+    split_info = json.loads(split_manifest_path.read_text())
+    if split_info.get("total_episodes", total_episodes) != total_episodes:
+        raise RuntimeError("Split manifest total_episodes does not match dataset")
+    train_episodes = split_info.get("train_episodes", [])
+    val_episodes = split_info.get("val_episodes", [])
+    test_episodes = split_info.get("test_episodes", [])
+    selected = train_episodes + val_episodes + test_episodes
+    if not train_episodes:
+        raise RuntimeError("Split manifest has no train episodes")
+    if len(selected) != len(set(selected)):
+        raise RuntimeError("Split manifest episode lists overlap or contain duplicates")
+    if any(episode not in lengths for episode in selected):
+        raise RuntimeError("Split manifest contains an out-of-range episode")
+    n_train = len(train_episodes)
+    n_val = len(val_episodes)
+    n_test = len(test_episodes)
+    manifest_task = split_info.get("task_prompt", "")
+else:
+    shuffled = episode_ids.copy()
+    random.Random(seed).shuffle(shuffled)
+    n_test = round(total_episodes * 0.1)
+    n_val = round(total_episodes * 0.1)
+    n_train = total_episodes - n_val - n_test
+    train_episodes = sorted(shuffled[:n_train])
 train_frames = sum(lengths[episode] for episode in train_episodes)
 steps_per_epoch = math.ceil(train_frames / global_batch_size)
 steps = steps_per_epoch * epochs
@@ -184,6 +210,7 @@ print(f"SAVE_FREQ={save_freq}")
 print(f"WARMUP_STEPS={warmup_steps}")
 print(f"AFO_LOOKAHEAD_FRAMES={lookahead}")
 print(f"DATASET_TASK={shlex.quote(dataset_task)}")
+print(f"MANIFEST_TASK={shlex.quote(manifest_task)}")
 PY
 )"; then
   echo "ERROR: could not read the train-ready dataset contract" >&2
@@ -191,7 +218,7 @@ PY
 fi
 eval "${metadata_exports}"
 
-TASK="${TASK_DESCRIPTION:-${DATASET_TASK}}"
+TASK="${TASK_DESCRIPTION:-${MANIFEST_TASK:-${DATASET_TASK}}}"
 if [[ -z "${TASK}" ]]; then
   echo "ERROR: TRAIN_READY.json does not contain one unique prompt; set TASK_DESCRIPTION" >&2
   exit 2
@@ -202,6 +229,7 @@ export PYTHONPATH="${SOURCE}/scripts/_ddp_shim:${SOURCE}/packages/anvil_trainer/
 printf '%s\n' \
   "Mode: ${MODE}" \
   "Dataset: ${DATASET_ROOT}" \
+  "Split manifest: ${SPLIT_MANIFEST:-random 8:1:1}" \
   "Episodes: total=${TOTAL_EPISODES}, train=${TRAIN_EPISODES}, val=${VAL_EPISODES}, test=${TEST_EPISODES}" \
   "Train frames: ${TRAIN_FRAMES}" \
   "Task: ${TASK}" \
@@ -263,6 +291,7 @@ run_training() {
   mkdir -p "${run_dir}"
   printf '%s\n' \
     "dataset=${DATASET_ROOT}" \
+    "split_manifest=${SPLIT_MANIFEST}" \
     "base_checkpoint=lerobot/pi05_base" \
     "mode=${kind}" \
     "train_expert_only=${TRAIN_EXPERT_ONLY}" \
@@ -277,6 +306,11 @@ run_training() {
     > "${run_dir}/RUN_CONFIG.txt"
 
   cd "${SOURCE}"
+  local split_arguments=(--split-ratio=8,1,1)
+  if [[ -n "${SPLIT_MANIFEST}" ]]; then
+    split_arguments=(--split-manifest="${SPLIT_MANIFEST}")
+  fi
+
   "${VENV}/bin/accelerate" launch \
     --num_processes="${WORLD_SIZE}" \
     --num_machines=1 \
@@ -302,7 +336,7 @@ run_training() {
     --policy.scheduler_decay_lr=2.5e-6 \
     --policy.normalization_mapping='{"VISUAL":"IDENTITY","STATE":"QUANTILES","ACTION":"QUANTILES"}' \
     --action-type=absolute \
-    --split-ratio=8,1,1 \
+    "${split_arguments[@]}" \
     --task-description="${TASK}" \
     --seed="${SEED}" \
     --job_name="${job_name}" \
@@ -317,7 +351,7 @@ run_training() {
     --resume=false \
     --wandb.enable="${wandb_enable}" \
     --wandb.mode=offline \
-    --note="pi05_base; ${kind}; ${TOTAL_EPISODES} episodes; AFO N${AFO_LOOKAHEAD_FRAMES}; absolute actions; ${WORLD_SIZE} GPUs; batch ${BATCH_PER_GPU}/rank global ${GLOBAL_BATCH_SIZE}; lr ${LEARNING_RATE}" \
+    --note="pi05_base; ${kind}; ${TRAIN_EPISODES}/${TOTAL_EPISODES} train episodes; AFO N${AFO_LOOKAHEAD_FRAMES}; absolute actions; ${WORLD_SIZE} GPUs; batch ${BATCH_PER_GPU}/rank global ${GLOBAL_BATCH_SIZE}; lr ${LEARNING_RATE}" \
     2>&1 | tee "${log_file}"
 
   printf 'completed_utc=%s\n' "$(date -u +%FT%TZ)" >> "${run_dir}/RUN_CONFIG.txt"

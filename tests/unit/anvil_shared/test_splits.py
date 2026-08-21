@@ -1,17 +1,16 @@
 """Tests for anvil_shared.splits."""
+
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
-
 from anvil_shared.splits import (
     compute_split_episodes,
     load_split_info,
     save_split_info,
+    validate_split_info,
 )
-
 
 # =============================================================================
 # compute_split_episodes
@@ -112,3 +111,45 @@ class TestSplitInfoRoundtrip:
         save_split_info(path, info)
         # Verify it's valid JSON that round-trips
         assert json.loads(path.read_text()) == info
+
+
+class TestValidateSplitInfo:
+    def test_curated_manifest_may_omit_source_episodes(self):
+        manifest = {
+            "total_episodes": 10,
+            "selected_episodes": [0, 2, 4, 6, 8],
+            "train_episodes": [4, 0, 2],
+            "val_episodes": [6],
+            "test_episodes": [8],
+            "curation_policy": "test-v1",
+        }
+
+        result = validate_split_info(manifest, total_episodes=10)
+
+        assert result["train_episodes"] == [0, 2, 4]
+        assert result["selected_episodes"] == [0, 2, 4, 6, 8]
+        assert result["curation_policy"] == "test-v1"
+
+    @pytest.mark.parametrize(
+        ("changes", "message"),
+        [
+            ({"val_episodes": [1, 2]}, "both train and val"),
+            ({"test_episodes": [10]}, "out-of-range"),
+            ({"train_episodes": [0, 0]}, "duplicate"),
+            ({"train_episodes": []}, "at least one"),
+            ({"selected_episodes": [0, 1]}, "must equal the union"),
+            ({"total_episodes": 9}, "does not match"),
+        ],
+    )
+    def test_invalid_manifest_is_rejected(self, changes, message):
+        manifest = {
+            "total_episodes": 10,
+            "selected_episodes": [0, 1, 2],
+            "train_episodes": [0, 1],
+            "val_episodes": [2],
+            "test_episodes": [],
+        }
+        manifest.update(changes)
+
+        with pytest.raises(ValueError, match=message):
+            validate_split_info(manifest, total_episodes=10)

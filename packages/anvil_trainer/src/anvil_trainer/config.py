@@ -80,6 +80,7 @@ class TrainingConfig:
     resume_job_path: str | None = None   # Job root dir (before checkpoints/)
     resume_checkpoint: str = "last"       # Checkpoint to resume from ("last" or e.g. "020000")
     split_ratio: list[float] = field(default_factory=lambda: [8.0, 1.0, 1.0])  # train/val/test episode split ratios
+    split_manifest: str | None = None  # Explicit curated train/val/test episode lists
     max_episodes: int | None = None  # Randomly subsample N episodes before train/val/test split (None = use all)
     # Vision backbone for ACT/Diffusion: resnet18 | resnet34 | resnet50 (VLA models ignore this)
     backbone: str = "resnet18"
@@ -148,6 +149,8 @@ class TrainingConfig:
 
         _me_raw = _pop_argv("max-episodes")
         max_episodes: int | None = int(_me_raw) if _me_raw else None
+
+        split_manifest = _pop_argv("split-manifest")
 
         # peek (no remove) — needed for naming and backbone injection
         dataset_root = _pop_argv("dataset.root", remove=False)
@@ -345,6 +348,7 @@ class TrainingConfig:
             resume_job_path=resume_job_path,
             resume_checkpoint=resume_checkpoint,
             split_ratio=split_ratio,
+            split_manifest=split_manifest,
             max_episodes=max_episodes,
             backbone=backbone,
             note=note,
@@ -369,6 +373,7 @@ class TrainingConfig:
             delta_exclude_joints=data.get("delta_exclude_joints"),
             dataset_root=data.get("dataset_root"),
             split_ratio=data.get("split_ratio", [8.0, 1.0, 1.0]),
+            split_manifest=data.get("split_manifest"),
             backbone=data.get("backbone", "resnet18"),
         )
 

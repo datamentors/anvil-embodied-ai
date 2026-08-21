@@ -7,6 +7,7 @@ Training utilities for Anvil robotics workflows with pluggable transforms. Suppo
 - **Camera filtering**: Train with a subset of available cameras
 - **Task override**: Override dataset task for SmolVLA training
 - **Delta actions**: Convert actions to relative (action - observation.state)
+- **Curated splits**: Load explicit, leakage-safe episode lists from a manifest
 
 ## Installation
 
@@ -38,6 +39,13 @@ LEROBOT_TASK_OVERRIDE="Pick up the red cube" anvil-trainer \
     --dataset.repo_id=local \
     --dataset.root=/path/to/dataset \
     --policy.type=smolvla
+
+# Train with an explicit curated split
+anvil-trainer \
+    --dataset.repo_id=local \
+    --dataset.root=/path/to/dataset \
+    --policy.type=pi05 \
+    --split-manifest=/path/to/split_info.json
 ```
 
 ### Python API
@@ -66,6 +74,7 @@ train(config)
 | Argument | Description |
 |----------|-------------|
 | `--use-delta-actions` | Convert actions to delta (action - state) |
+| `--split-manifest=PATH` | Use explicit, disjoint source episode IDs for train/val/test |
 
 ## Adding Custom Transforms
 

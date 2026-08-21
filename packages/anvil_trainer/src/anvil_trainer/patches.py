@@ -30,7 +30,12 @@ from pathlib import Path
 from typing import Any
 
 from anvil_shared.provenance import git_provenance
-from anvil_shared.splits import compute_split_episodes, load_split_info, save_split_info
+from anvil_shared.splits import (
+    compute_split_episodes,
+    load_split_info,
+    save_split_info,
+    validate_split_info,
+)
 
 from anvil_trainer.config import TrainingConfig
 from anvil_trainer.transforms import (
@@ -394,7 +399,9 @@ class TransformRunner:
         """Monkey-patch make_dataset to create train/val/test splits, and capture preprocessor."""
         s = self.config.split_ratio
         total_r = sum(s)
-        if total_r <= 0 or (s[1] <= 0 and (len(s) < 3 or s[2] <= 0)):
+        if self.config.split_manifest is None and (
+            total_r <= 0 or (s[1] <= 0 and (len(s) < 3 or s[2] <= 0))
+        ):
             return  # no val or test, skip patching
 
         import lerobot.datasets.factory as factory_mod
@@ -438,10 +445,22 @@ class TransformRunner:
             split_info_path = Path(cfg.output_dir) / "checkpoints" / "last" / "pretrained_model" / "split_info.json"
             loaded_split = load_split_info(split_info_path)
             if loaded_split is not None:
-                train_ep = loaded_split.get("train_episodes", [])
-                val_ep = loaded_split.get("val_episodes", [])
-                test_ep = loaded_split.get("test_episodes", [])
-                log.info("[split] Loaded random splits from %s", split_info_path)
+                loaded_split = validate_split_info(loaded_split, total_ep)
+                log.info("[split] Loaded checkpoint split manifest from %s", split_info_path)
+            elif val_state.config.split_manifest is not None:
+                manifest_path = Path(val_state.config.split_manifest).expanduser()
+                loaded_split = load_split_info(manifest_path)
+                if loaded_split is None:
+                    raise FileNotFoundError(
+                        f"[split] Explicit split manifest is missing or invalid: {manifest_path}"
+                    )
+                loaded_split = validate_split_info(loaded_split, total_ep)
+                log.info("[split] Loaded explicit curated split manifest from %s", manifest_path)
+
+            if loaded_split is not None:
+                train_ep = loaded_split["train_episodes"]
+                val_ep = loaded_split["val_episodes"]
+                test_ep = loaded_split["test_episodes"]
             else:
                 train_ep = val_ep = test_ep = None
 
@@ -469,13 +488,15 @@ class TransformRunner:
 
             # Store split info for anvil_config.json (as full lists now)
             val_state._split_info = {
-                "split_ratio": list(s),
+                **(loaded_split or {}),
+                "split_ratio": (loaded_split or {}).get("split_ratio", list(s)),
                 "total_episodes": total_ep,
                 "train_episodes": train_ep,
                 "val_episodes": val_ep,
                 "test_episodes": test_ep,
                 **({"max_episodes": val_state.config.max_episodes} if val_state.config.max_episodes is not None else {}),
             }
+            split_kind = "curated" if loaded_split is not None else "randomly selected"
 
             def _make_dataloader(dataset):
                 return torch.utils.data.DataLoader(
@@ -494,14 +515,24 @@ class TransformRunner:
                 cfg.dataset.episodes = val_ep
                 val_dataset = original_make_dataset(cfg)
                 val_state._val_dataloader = _make_dataloader(val_dataset)
-                log.info("[split] val=%d ep (randomly selected, %d frames)", len(val_ep), val_dataset.num_frames)
+                log.info(
+                    "[split] val=%d ep (%s, %d frames)",
+                    len(val_ep),
+                    split_kind,
+                    val_dataset.num_frames,
+                )
 
             # Test dataloader
             if test_ep:
                 cfg.dataset.episodes = test_ep
                 test_dataset = original_make_dataset(cfg)
                 val_state._test_dataloader = _make_dataloader(test_dataset)
-                log.info("[split] test=%d ep (randomly selected, %d frames)", len(test_ep), test_dataset.num_frames)
+                log.info(
+                    "[split] test=%d ep (%s, %d frames)",
+                    len(test_ep),
+                    split_kind,
+                    test_dataset.num_frames,
+                )
 
             # Train dataset
             cfg.dataset.episodes = train_ep
@@ -517,7 +548,7 @@ class TransformRunner:
             if _patched_action_stats is not None:
                 train_dataset.meta.stats["action"] = _patched_action_stats
                 log.info("[delta_stats] Patched train_dataset.meta.stats['action'] with delta stats")
-            log.info("[split] train=%d ep (randomly selected)", len(train_ep))
+            log.info("[split] train=%d ep (%s)", len(train_ep), split_kind)
             return train_dataset
 
         self._patch(factory_mod, "make_dataset", patched_make_dataset)

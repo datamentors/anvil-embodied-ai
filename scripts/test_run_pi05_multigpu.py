@@ -108,3 +108,82 @@ def test_preflight_uses_marker_prompt_and_configured_global_batch(tmp_path: Path
     assert "Task: Move the object to the goal" in result.stdout
     assert "AFO lookahead: 7 frames" in result.stdout
     assert "Training preflight passed; no process was started." in result.stdout
+
+
+def test_preflight_uses_curated_manifest_episode_lists_and_prompt(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    (dataset / "meta" / "episodes").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text("{}")
+    (dataset / "meta" / "stats.json").write_text("{}")
+    (dataset / "TRAIN_READY.json").write_text(
+        json.dumps(
+            {
+                "facts": {
+                    "action_type": "absolute",
+                    "afo_lookahead_frames": 10,
+                    "task_prompts": ["Old generic prompt"],
+                }
+            }
+        )
+    )
+    pq.write_table(
+        pa.table({"episode_index": list(range(10)), "length": [64] * 10}),
+        dataset / "meta" / "episodes" / "episodes.parquet",
+    )
+    manifest = tmp_path / "split_info.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "total_episodes": 10,
+                "train_episodes": [0, 2, 4, 6],
+                "val_episodes": [1],
+                "test_episodes": [3],
+                "task_prompt": "Use the complete routing instruction",
+            }
+        )
+    )
+
+    source = tmp_path / "source"
+    shim = source / "scripts" / "_ddp_shim" / "sitecustomize.py"
+    shim.parent.mkdir(parents=True)
+    shim.write_text("")
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    python_wrapper = venv_bin / "python"
+    python_wrapper.write_text(f'#!/usr/bin/env bash\nexec {Path(sys.executable)!s} "$@"\n')
+    python_wrapper.chmod(0o755)
+    for executable in ("accelerate", "anvil-trainer"):
+        path = venv_bin / executable
+        path.write_text("#!/usr/bin/env bash\nexit 0\n")
+        path.chmod(0o755)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    nvidia_smi = fake_bin / "nvidia-smi"
+    nvidia_smi.write_text("#!/usr/bin/env bash\nexit 0\n")
+    nvidia_smi.chmod(0o755)
+    hf_cache = tmp_path / "hf-cache"
+    hf_cache.mkdir()
+
+    environment = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "DATASET_ROOT": str(dataset),
+        "SPLIT_MANIFEST": str(manifest),
+        "ANVIL_TRAIN_SOURCE": str(source),
+        "VENV": str(venv_bin.parent),
+        "HF_CACHE": str(hf_cache),
+        "RUN_ROOT": str(tmp_path / "runs"),
+        "PREFLIGHT_ONLY": "1",
+    }
+    result = subprocess.run(
+        [str(SCRIPT), "expert_only"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Episodes: total=10, train=4, val=1, test=1" in result.stdout
+    assert "Task: Use the complete routing instruction" in result.stdout
+    assert f"Split manifest: {manifest}" in result.stdout
