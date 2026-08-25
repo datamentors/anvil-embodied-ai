@@ -47,6 +47,11 @@ from mcap_convert_gpu import (
     McapReader,
 )
 from mcap_convert_gpu.cli.mcap_valid import default_report_paths
+from mcap_convert_gpu.core.episode_labels import (
+    build_label_table,
+    install_episode_metadata_injector,
+    resolve_label_keys,
+)
 from mcap_convert_gpu.core.extractor import BufferedStreamExtractor
 from mcap_convert_gpu.core.quality import SEVERITY_CRITICAL, SEVERITY_PASS, SEVERITY_WARNING
 from mcap_convert_gpu.core.reader import snap_fps
@@ -531,6 +536,7 @@ def _convert_shard_worker(
     encoder_threads: int | None,
     progress_update_every: int,
     gpu_id: int | None = None,
+    extra_episode_keys: tuple = (),
 ) -> dict:
     """Worker process entrypoint for one shard of episodes.
 
@@ -574,6 +580,7 @@ def _convert_shard_worker(
             progress_update_every=progress_update_every,
             use_live_progress=False,
             parallel_episode_workers=1,
+            extra_episode_keys=extra_episode_keys,
         )
 
     return {
@@ -611,6 +618,7 @@ def convert_session(
     progress_update_every: int = 1,
     use_live_progress: bool = True,
     parallel_episode_workers: int = 1,
+    extra_episode_keys: tuple = (),
 ):
     """
     Convert MCAP session to LeRobot dataset
@@ -740,6 +748,7 @@ def convert_session(
                             encoder_threads=encoder_threads,
                             progress_update_every=progress_update_every,
                             gpu_id=shard_gpu_id,
+                            extra_episode_keys=extra_episode_keys,
                         )
                         future_map[future] = (shard_index, len(shard_files))
                         shard_log_paths.append(shard_output_dir.parent / f"shard-{shard_index:03d}.log")
@@ -883,6 +892,25 @@ def convert_session(
             joint_names=joint_names,
             camera_names=camera_names,
         )
+
+    # Carry recorder labels (envelope size/facing side, ...) into meta/episodes as
+    # columns, plus provenance for which MCAP produced which episode. The key set
+    # is fixed once per run: LeRobot flushes episode metadata through pyarrow and
+    # a key present on only some episodes fails at flush time.
+    label_keys = resolve_label_keys(mcap_files, output_dir, resume_from, tuple(extra_episode_keys or ()))
+    label_table, incomplete_labels = build_label_table(mcap_files, label_keys)
+    episode_extra = install_episode_metadata_injector(dataset)
+    _labelled = [k for k in label_keys if not k.startswith("source_")]
+    if _labelled:
+        log(f"Episode labels: [bold]{', '.join(_labelled)}[/bold]")
+        if incomplete_labels:
+            log(
+                f"  [yellow]{len(incomplete_labels)} episode(s) missing a label[/yellow] "
+                f"([dim]{', '.join(incomplete_labels[:8])}"
+                f"{' ...' if len(incomplete_labels) > 8 else ''}[/dim]) — written as empty"
+            )
+    else:
+        log("Episode labels: [dim]none found in recorder metadata.json[/dim]")
 
     # Copy conversion config for inference generation during training (skip if resuming)
     conversion_config_dest = os.path.join(output_dir, "conversion_config.yaml")
@@ -1061,6 +1089,8 @@ def convert_session(
                 episode_task,
                 status=f"[yellow]saving {frame_count} frames...[/yellow]",
             )
+            episode_extra.clear()
+            episode_extra.update(label_table[str(mcap_path)])
             with suppress_fd_output():
                 dataset.save_episode()
 
@@ -1248,6 +1278,13 @@ def build_parser(profile: str = "standard") -> argparse.ArgumentParser:
         "--max-episodes", type=int, default=None,
         metavar="N",
         help="only convert the first N episodes (default: convert all)",
+    )
+    parser.add_argument(
+        "--extra-episode-keys", default="", metavar="K1,K2",
+        help="Additional keys to lift from each episode's recorder metadata.json into "
+             "meta/episodes as columns. The envelope keys written by label-session "
+             "(envelope_size, envelope_facing_side, destination_basket_side, arm) are "
+             "picked up automatically when present.",
     )
     parser.add_argument(
         "--act-from-obs-n-step", type=int, default=None,
@@ -1531,6 +1568,9 @@ def main_with_profile(args=None, profile: str = "standard"):
             progress_update_every=defaults["progress_update_every"],
             use_live_progress=console.is_terminal and sys.stdout.isatty(),
             parallel_episode_workers=requested_parallel_workers,
+            extra_episode_keys=tuple(
+                k.strip() for k in args.extra_episode_keys.split(",") if k.strip()
+            ),
         )
 
         # Upload to Hub if requested

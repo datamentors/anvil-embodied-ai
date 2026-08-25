@@ -53,6 +53,9 @@ dataset-viz = "mcap_converter.cli.dataset_viz:main"
 hf-upload = "mcap_converter.cli.upload:main"
 mcap-to-video = "mcap_converter.cli.video:main"
 merge-datasets = "mcap_converter.cli.merge_datasets:main"
+stratified-split = "mcap_converter.cli.stratified_split:main"
+label-session = "mcap_converter.cli.label_session:main"
+annotate-dataset = "mcap_converter.cli.annotate_dataset:main"
 mcap-valid = "mcap_converter.cli.mcap_valid:main"
 
 [project.urls]
