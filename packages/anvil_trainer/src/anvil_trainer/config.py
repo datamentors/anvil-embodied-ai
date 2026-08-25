@@ -81,6 +81,10 @@ class TrainingConfig:
     resume_checkpoint: str = "last"       # Checkpoint to resume from ("last" or e.g. "020000")
     split_ratio: list[float] = field(default_factory=lambda: [8.0, 1.0, 1.0])  # train/val/test episode split ratios
     max_episodes: int | None = None  # Randomly subsample N episodes before train/val/test split (None = use all)
+    # Pre-computed split file (split_info.json shape, e.g. from `stratified-split`).
+    # When set, episode lists are read from it instead of being sampled randomly;
+    # --split-ratio and --max-episodes are then ignored.
+    split_file: str | None = None
     # Vision backbone for ACT/Diffusion: resnet18 | resnet34 | resnet50 (VLA models ignore this)
     backbone: str = "resnet18"
     note: str | None = None         # Free-text note for this run (also sent to wandb as run notes)
@@ -148,6 +152,11 @@ class TrainingConfig:
 
         _me_raw = _pop_argv("max-episodes")
         max_episodes: int | None = int(_me_raw) if _me_raw else None
+
+        _split_file_raw = _pop_argv("split-file")
+        split_file: str | None = _split_file_raw or None
+        if split_file and not Path(split_file).exists():
+            raise ValueError(f"--split-file={split_file!r} does not exist.")
 
         # peek (no remove) — needed for naming and backbone injection
         dataset_root = _pop_argv("dataset.root", remove=False)
@@ -346,6 +355,7 @@ class TrainingConfig:
             resume_checkpoint=resume_checkpoint,
             split_ratio=split_ratio,
             max_episodes=max_episodes,
+            split_file=split_file,
             backbone=backbone,
             note=note,
             note_append=note_append,
@@ -369,6 +379,7 @@ class TrainingConfig:
             delta_exclude_joints=data.get("delta_exclude_joints"),
             dataset_root=data.get("dataset_root"),
             split_ratio=data.get("split_ratio", [8.0, 1.0, 1.0]),
+            split_file=data.get("split_file"),
             backbone=data.get("backbone", "resnet18"),
         )
 
