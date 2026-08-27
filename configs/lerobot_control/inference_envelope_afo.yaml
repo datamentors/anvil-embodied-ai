@@ -306,8 +306,9 @@ watchdog:
   # camera timeout.
   max_sensor_skew_sec: 0.12
   # Maximum time an action may remain based on the last accepted observation.
-  # Pi0.5 inference observed at ~0.55–0.59 s; keep margin above normal latency.
-  # 1.65 is the reviewed shadow value; sensor freshness above stays strict.
-  max_action_age_sec: 1.65
+  # Pi0.5 inference is normally ~0.55–0.59 s, with observed isolated forwards
+  # up to ~0.76 s. Keep bounded tail-latency margin without permitting a stale
+  # multi-second action backlog; sensor freshness above stays strict.
+  max_action_age_sec: 1.80
   # Allows drivers and image worker processes to start before latching missing inputs.
   startup_grace_sec: 10.0

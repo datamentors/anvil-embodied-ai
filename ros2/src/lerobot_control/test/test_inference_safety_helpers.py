@@ -1605,7 +1605,7 @@ def test_envelope_profile_has_bounded_saturation_and_provenance() -> None:
         "rtc_provenance": True,
     }
     assert config["inference_tuning"]["rtc"]["execution_horizon"] == 35
-    assert config["watchdog"]["max_action_age_sec"] == 1.65
+    assert config["watchdog"]["max_action_age_sec"] == 1.80
 
 
 def test_bounded_saturation_clamps_inside_margin_and_counts() -> None:
