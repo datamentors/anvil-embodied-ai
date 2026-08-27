@@ -60,7 +60,13 @@ from lerobot_control.inference_node import (
     RTCMergeStageTiming,
     VLAObservationTiming,
 )
-from lerobot_control.input_watchdog import WatchdogResult, WatchdogState
+from lerobot_control.input_watchdog import (
+    ObservationProvenance,
+    ObservationSequence,
+    SensorReading,
+    WatchdogResult,
+    WatchdogState,
+)
 
 
 class FakeQueue:
@@ -382,6 +388,9 @@ def make_two_arm_node() -> LeRobotInferenceNode:
     node.strategy = SimpleNamespace(get_current_joint_positions=lambda: positions)
     node._joint_position_limits = dict.fromkeys(positions, (-1.0, 1.0))
     node._joint_limit_tolerance = 1e-6
+    node._saturate_joint_targets = frozenset()
+    node._saturate_joint_margins = {}
+    node._saturation_counts = {}
     node.action_limiter = PassThroughLimiter()
     node.arm_publishers = {"left": FakePublisher(), "right": FakePublisher()}
     node._monitor_enable = False
@@ -389,7 +398,8 @@ def make_two_arm_node() -> LeRobotInferenceNode:
     node._debug = False
     node.metrics = FakeMetrics()
     node._has_published = False
-    node.get_logger = lambda: FakeLogger()
+    logger = FakeLogger()
+    node.get_logger = lambda: logger
     return node
 
 
@@ -1535,7 +1545,12 @@ def test_duplicate_camera_feature_mapping_is_rejected() -> None:
 
 @pytest.mark.parametrize(
     "config_name",
-    ("inference_default.yaml", "inference_eval.yaml", "inference_single_arm.yaml"),
+    (
+        "inference_default.yaml",
+        "inference_default_afo.yaml",
+        "inference_eval.yaml",
+        "inference_single_arm.yaml",
+    ),
 )
 def test_deploy_configs_have_complete_valid_urdf_limit_mapping(config_name) -> None:
     config_path = find_deploy_config(config_name)
@@ -1561,6 +1576,69 @@ def test_deploy_configs_have_complete_valid_urdf_limit_mapping(config_name) -> N
     assert rtc["readiness_index_phase_tolerance_steps"] == 1
     assert rtc["readiness_scheduler_guard_steps"] == 1
     assert rtc["readiness_min_guided_overlap_steps"] == 3
+
+
+def test_envelope_profile_has_bounded_saturation_and_provenance() -> None:
+    config_path = find_deploy_config("inference_envelope_afo.yaml")
+    config = yaml.safe_load(config_path.read_text())
+    node = object.__new__(LeRobotInferenceNode)
+    node.arms_config = config["arms"]
+    node.joint_names_config = config["joint_names"]
+    node._joint_position_limits = node._parse_joint_position_limits(
+        config["safety"]["joint_position_limits"]
+    )
+    node._saturate_joint_targets = node._parse_saturate_joint_targets(
+        config["safety"]["saturate_joint_targets"]
+    )
+
+    margins = node._parse_saturate_joint_margins(
+        config["safety"]["saturate_joint_margins"]
+    )
+
+    assert set(margins) == set(node._joint_position_limits)
+    assert max(margins.values()) <= node.MAX_SATURATION_MARGIN_RAD
+    assert config["diagnostics"] == {
+        "rtc_timing": True,
+        "rtc_cuda_events": False,
+        "rtc_provenance": True,
+    }
+    assert config["inference_tuning"]["rtc"]["execution_horizon"] == 35
+    assert config["watchdog"]["max_action_age_sec"] == 1.65
+
+
+def test_bounded_saturation_clamps_inside_margin_and_counts() -> None:
+    node = make_two_arm_node()
+    node._saturate_joint_targets = frozenset({"follower_r_joint2"})
+    node._saturate_joint_margins = {"follower_r_joint2": 0.02}
+
+    node._publish_action(np.array([0.1, 0.2, 0.3, 1.015]))
+
+    assert node.arm_publishers["left"].messages == [[0.1, 0.2]]
+    assert node.arm_publishers["right"].messages == [[0.3, 1.0]]
+    assert node._saturation_counts == {"follower_r_joint2": 1}
+    assert len(node.get_logger().warn_messages) == 1
+
+
+def test_saturation_past_margin_still_fails_closed() -> None:
+    node = make_two_arm_node()
+    node._saturate_joint_targets = frozenset({"follower_r_joint2"})
+    node._saturate_joint_margins = {"follower_r_joint2": 0.02}
+
+    with pytest.raises(ValueError, match="follower_r_joint2"):
+        node._publish_action(np.array([0.1, 0.2, 0.3, 1.021]))
+
+    assert node.arm_publishers["left"].messages == []
+    assert node.arm_publishers["right"].messages == []
+    assert node._saturation_counts == {}
+
+
+@pytest.mark.parametrize("margin", [0.0, -0.01, 0.051, float("nan")])
+def test_invalid_saturation_margin_is_rejected(margin) -> None:
+    node = make_two_arm_node()
+    node._saturate_joint_targets = frozenset({"follower_r_joint2"})
+
+    with pytest.raises(ValueError, match="saturate_joint_margins"):
+        node._parse_saturate_joint_margins({"follower_r_joint2": margin})
 
 
 @pytest.mark.parametrize(
@@ -1745,6 +1823,66 @@ def test_rtc_timing_disabled_is_a_complete_noop():
     )
 
     assert logger.info_messages == []
+
+
+def test_rtc_provenance_correlates_exact_sensor_samples_and_chunk() -> None:
+    node = object.__new__(LeRobotInferenceNode)
+    node._rtc_provenance_enabled = True
+    logger = FakeLogger()
+    node.get_logger = lambda: logger
+    provenance = ObservationProvenance(
+        joint_state=SensorReading("joint_states", 101, 19.97, 123.456),
+        cameras=(
+            SensorReading("camera:base", 201, 19.95, 123.450),
+            SensorReading("camera:left_wrist", 202, 19.96, 123.451),
+            SensorReading("camera:right_wrist", 203, 19.98, 123.452),
+        ),
+    )
+    sequence = ObservationSequence(
+        joint_state=101,
+        cameras=(("base", 201), ("left_wrist", 202), ("right_wrist", 203)),
+    )
+    chunk = np.arange(12, dtype=np.float32).reshape(3, 4)
+
+    node._log_rtc_provenance(
+        sample_id=9,
+        sequence=sequence,
+        provenance=provenance,
+        requested_at_monotonic=20.0,
+        processed_chunk=chunk,
+    )
+
+    assert len(logger.info_messages) == 1
+    message = logger.info_messages[0]
+    for expected in (
+        "[RTC_PROVENANCE] sample=9 observation_joint_seq=101",
+        "oldest_receipt_age_ms=50.000",
+        "receipt_skew_ms=30.000",
+        "ros_stamp_skew_ms=6.000",
+        "chunk_shape=3x4",
+        "first_action=[0.000000,1.000000,2.000000,3.000000]",
+        "joint_states_seq=101 joint_states_stamp=123.456000000",
+        "camera_base_seq=201 camera_base_stamp=123.450000000",
+    ):
+        assert expected in message
+
+
+def test_rtc_provenance_disabled_is_a_complete_noop() -> None:
+    node = object.__new__(LeRobotInferenceNode)
+    node._rtc_provenance_enabled = False
+    logger = FakeLogger()
+    node.get_logger = lambda: logger
+
+    node._log_rtc_provenance(
+        sample_id=1,
+        sequence=ObservationSequence(1, ()),
+        provenance=None,
+        requested_at_monotonic=1.0,
+        processed_chunk=np.zeros((1, 1), dtype=np.float32),
+    )
+
+    assert logger.info_messages == []
+    assert logger.error_messages == []
 
 
 def test_cuda_timing_waits_for_query_and_never_synchronizes():

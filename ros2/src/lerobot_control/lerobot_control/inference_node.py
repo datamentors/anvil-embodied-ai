@@ -17,6 +17,7 @@ Publishes:
     - /monitor/obs_state, /monitor/raw_output, /monitor/control_cmd  (when monitor_enable:=true)
 """
 
+import hashlib
 import json
 import math
 import threading
@@ -37,7 +38,13 @@ from std_srvs.srv import Trigger
 
 from .action_limiter import ActionLimiter
 from .delta_restore import resolve_action_type, restore_delta_chunk
-from .input_watchdog import InputSnapshot, InputWatchdog, WatchdogResult
+from .input_watchdog import (
+    InputSnapshot,
+    InputWatchdog,
+    ObservationProvenance,
+    ObservationSequence,
+    WatchdogResult,
+)
 from .metrics_tracker import MetricsTracker
 from .model_loader import ModelLoader, set_deterministic_mode
 
@@ -306,10 +313,15 @@ class LeRobotInferenceNode(Node):
         self._rtc_cuda_timing_enabled = diagnostics_config.get(
             "rtc_cuda_events", False
         )
+        self._rtc_provenance_enabled = diagnostics_config.get(
+            "rtc_provenance", False
+        )
         if not isinstance(self._rtc_timing_enabled, bool):
             raise ValueError("diagnostics.rtc_timing must be a boolean")
         if not isinstance(self._rtc_cuda_timing_enabled, bool):
             raise ValueError("diagnostics.rtc_cuda_events must be a boolean")
+        if not isinstance(self._rtc_provenance_enabled, bool):
+            raise ValueError("diagnostics.rtc_provenance must be a boolean")
         if self._rtc_cuda_timing_enabled and not self._rtc_timing_enabled:
             raise ValueError(
                 "diagnostics.rtc_cuda_events requires diagnostics.rtc_timing"
@@ -333,6 +345,8 @@ class LeRobotInferenceNode(Node):
             safety_config.get("joint_limit_tolerance", 1e-6)
         )
         raw_joint_position_limits = safety_config.get("joint_position_limits", {})
+        raw_saturate_joint_targets = safety_config.get("saturate_joint_targets", [])
+        raw_saturate_joint_margins = safety_config.get("saturate_joint_margins", {})
 
         watchdog_config = self.config.get("watchdog", {})
         self._watchdog_camera_timeout_sec = float(
@@ -406,6 +420,13 @@ class LeRobotInferenceNode(Node):
             )
         else:
             self._joint_position_limits = {}
+        self._saturate_joint_targets = self._parse_saturate_joint_targets(
+            raw_saturate_joint_targets
+        )
+        self._saturate_joint_margins = self._parse_saturate_joint_margins(
+            raw_saturate_joint_margins
+        )
+        self._saturation_counts: dict[str, int] = {}
 
         # Inference tuning — per model type (resolved after model_type is known)
         self._tuning_config = self.config.get("inference_tuning", {})
@@ -486,6 +507,68 @@ class LeRobotInferenceNode(Node):
                 "safety.joint_limit_tolerance must be finite and between 0 and 1e-6"
             )
         return tolerance
+
+    def _parse_saturate_joint_targets(self, raw_names) -> frozenset[str]:
+        """Validate joints allowed to clamp to their own absolute limits."""
+        if not raw_names:
+            return frozenset()
+        if isinstance(raw_names, str) or not isinstance(raw_names, (list, tuple)):
+            raise ValueError("safety.saturate_joint_targets must be a list of names")
+
+        names = frozenset(str(name) for name in raw_names)
+        unknown = sorted(names - set(self._joint_position_limits))
+        if unknown:
+            raise ValueError(
+                "safety.saturate_joint_targets must reference joints declared in "
+                "safety.joint_position_limits: unknown=" + ",".join(unknown)
+            )
+        return names
+
+    # This is an acceptance band for a bounded recording artefact, never extra
+    # robot travel. The published target remains clamped to the hard limit.
+    MAX_SATURATION_MARGIN_RAD = 0.05
+
+    def _parse_saturate_joint_margins(self, raw_margins) -> dict[str, float]:
+        """Validate the bounded overshoot accepted for each saturating joint."""
+        if not self._saturate_joint_targets:
+            if raw_margins:
+                raise ValueError(
+                    "safety.saturate_joint_margins is set but "
+                    "safety.saturate_joint_targets is empty"
+                )
+            return {}
+        if not isinstance(raw_margins, dict):
+            raise ValueError("safety.saturate_joint_margins must be a mapping")
+
+        actual = set(raw_margins)
+        missing = sorted(self._saturate_joint_targets - actual)
+        extra = sorted(actual - self._saturate_joint_targets)
+        if missing or extra:
+            details = []
+            if missing:
+                details.append("missing=" + ",".join(missing))
+            if extra:
+                details.append("unexpected=" + ",".join(extra))
+            raise ValueError(
+                "safety.saturate_joint_margins must exactly cover "
+                "safety.saturate_joint_targets: " + "; ".join(details)
+            )
+
+        parsed: dict[str, float] = {}
+        for name in sorted(self._saturate_joint_targets):
+            margin = float(raw_margins[name])
+            if not math.isfinite(margin) or margin <= 0.0:
+                raise ValueError(
+                    f"safety.saturate_joint_margins[{name}] must be positive "
+                    f"and finite, got {margin}"
+                )
+            if margin > self.MAX_SATURATION_MARGIN_RAD:
+                raise ValueError(
+                    f"safety.saturate_joint_margins[{name}]={margin} exceeds "
+                    f"the {self.MAX_SATURATION_MARGIN_RAD} rad ceiling"
+                )
+            parsed[name] = margin
+        return parsed
 
     def _parse_joint_position_limits(
         self,
@@ -854,6 +937,7 @@ class LeRobotInferenceNode(Node):
             with self._obs_lock:
                 self._latest_obs = None
                 self._latest_obs_timing = None
+                self._latest_obs_provenance = None
                 self._last_inferred_observation_sequence = None
 
         if hasattr(self, "_action_queue"):
@@ -964,6 +1048,7 @@ class LeRobotInferenceNode(Node):
         self._latency_tracker = LatencyStats(maxlen=100)
         self._latest_obs = None
         self._latest_obs_timing = None
+        self._latest_obs_provenance = None
         self._last_inferred_observation_sequence = None
         self._obs_lock = threading.Lock()
         self._inference_stop = threading.Event()
@@ -1845,6 +1930,97 @@ class LeRobotInferenceNode(Node):
                 f"sample={pending.sample_id} cuda_model_ms={cuda_model_ms:.3f}"
             )
 
+    def _log_rtc_provenance(
+        self,
+        *,
+        sample_id: int,
+        sequence: ObservationSequence,
+        provenance: ObservationProvenance | None,
+        requested_at_monotonic: float,
+        processed_chunk: object,
+    ) -> None:
+        """Correlate one model chunk with the exact sensor samples it consumed."""
+        if not self._rtc_provenance_enabled:
+            return
+        if provenance is None:
+            self.get_logger().error(
+                f"[RTC_PROVENANCE] sample={sample_id} missing exact sensor provenance"
+            )
+            return
+
+        readings = (provenance.joint_state, *provenance.cameras)
+        receipt_ages_ms = [
+            (requested_at_monotonic - reading.last_seen_monotonic) * 1000.0
+            for reading in readings
+            if reading.last_seen_monotonic is not None
+        ]
+        ros_stamps = [
+            reading.ros_timestamp
+            for reading in readings
+            if reading.ros_timestamp is not None and math.isfinite(reading.ros_timestamp)
+        ]
+        oldest_receipt_age_ms = max(receipt_ages_ms, default=math.nan)
+        receipt_skew_ms = (
+            max(receipt_ages_ms) - min(receipt_ages_ms)
+            if receipt_ages_ms
+            else math.nan
+        )
+        ros_stamp_skew_ms = (
+            (max(ros_stamps) - min(ros_stamps)) * 1000.0
+            if ros_stamps
+            else math.nan
+        )
+
+        if isinstance(processed_chunk, torch.Tensor):
+            chunk = processed_chunk.detach().to(device="cpu", dtype=torch.float32).numpy()
+        else:
+            chunk = np.asarray(processed_chunk, dtype=np.float32)
+        if chunk.ndim == 3 and chunk.shape[0] == 1:
+            chunk = chunk[0]
+        if chunk.ndim == 1:
+            chunk = chunk[np.newaxis, :]
+        chunk = np.ascontiguousarray(chunk)
+        first_action = chunk[0] if chunk.size else np.array([], dtype=np.float32)
+        first_five_mean = (
+            chunk[: min(5, len(chunk))].mean(axis=0)
+            if chunk.size
+            else np.array([], dtype=np.float32)
+        )
+        chunk_digest = hashlib.sha256(chunk.tobytes()).hexdigest()[:16]
+
+        def reading_fields(reading) -> str:
+            safe_name = reading.name.replace("camera:", "camera_").replace(":", "_")
+            stamp = (
+                f"{reading.ros_timestamp:.9f}"
+                if reading.ros_timestamp is not None
+                else "nan"
+            )
+            age = (
+                (requested_at_monotonic - reading.last_seen_monotonic) * 1000.0
+                if reading.last_seen_monotonic is not None
+                else math.nan
+            )
+            return (
+                f"{safe_name}_seq={reading.sequence} "
+                f"{safe_name}_stamp={stamp} "
+                f"{safe_name}_receipt_age_ms={age:.3f}"
+            )
+
+        first_text = ",".join(f"{value:.6f}" for value in first_action)
+        mean_text = ",".join(f"{value:.6f}" for value in first_five_mean)
+        sensor_text = " ".join(reading_fields(reading) for reading in readings)
+        self.get_logger().info(
+            "[RTC_PROVENANCE] "
+            f"sample={sample_id} observation_joint_seq={sequence.joint_state} "
+            f"oldest_receipt_age_ms={oldest_receipt_age_ms:.3f} "
+            f"receipt_skew_ms={receipt_skew_ms:.3f} "
+            f"ros_stamp_skew_ms={ros_stamp_skew_ms:.3f} "
+            f"chunk_shape={'x'.join(str(size) for size in chunk.shape)} "
+            f"chunk_sha256={chunk_digest} "
+            f"first_action=[{first_text}] first5_mean=[{mean_text}] "
+            f"{sensor_text}"
+        )
+
     def _start_rtc_cuda_timing(self) -> tuple[object, object] | None:
         """Create and record a CUDA event pair without affecting inference."""
         if not self._rtc_cuda_timing_enabled:
@@ -1940,6 +2116,9 @@ class LeRobotInferenceNode(Node):
                         observation_timing = getattr(
                             self, "_latest_obs_timing", None
                         )
+                        observation_provenance = getattr(
+                            self, "_latest_obs_provenance", None
+                        )
                     if obs_record is not None:
                         obs, sequence, epoch, observation_monotonic = obs_record
                         if (
@@ -1961,8 +2140,9 @@ class LeRobotInferenceNode(Node):
 
             guided = self._rtc_has_guidance(prev_actions)
             timing_enabled = self._rtc_timing_enabled
+            provenance_enabled = self._rtc_provenance_enabled
             sample_id = self._rtc_timing_next_sample_id
-            if timing_enabled:
+            if timing_enabled or provenance_enabled:
                 self._rtc_timing_next_sample_id += 1
 
             # Compute inference delay from latency history
@@ -2085,6 +2265,14 @@ class LeRobotInferenceNode(Node):
                     commit_completed_at=commit_completed_at,
                     merge_timing=merge_timing,
                 )
+            if provenance_enabled:
+                self._log_rtc_provenance(
+                    sample_id=sample_id,
+                    sequence=sequence,
+                    provenance=observation_provenance,
+                    requested_at_monotonic=dispatch.requested_at_monotonic,
+                    processed_chunk=processed,
+                )
             self._drain_rtc_cuda_timings()
 
     def _preprocess_vla_observation(self, observation: dict) -> dict:
@@ -2138,6 +2326,11 @@ class LeRobotInferenceNode(Node):
 
         sequence = self.strategy.get_last_observation_sequence()
         observation_monotonic = self.strategy.get_last_observation_monotonic()
+        observation_provenance = (
+            self.strategy.get_last_observation_provenance()
+            if self._rtc_provenance_enabled
+            else None
+        )
         try:
             snapshot = self.strategy.get_input_snapshot(self.camera_names)
         except Exception as exc:
@@ -2149,6 +2342,12 @@ class LeRobotInferenceNode(Node):
             return
         if sequence is None or observation_monotonic is None:
             self._latch_watchdog("strategy returned an observation without a sequence", snapshot)
+            return
+        if self._rtc_provenance_enabled and observation_provenance is None:
+            self._latch_watchdog(
+                "strategy returned an observation without exact sensor provenance",
+                snapshot,
+            )
             return
 
         with self._safety_lock:
@@ -2189,6 +2388,7 @@ class LeRobotInferenceNode(Node):
                             observation_monotonic,
                         )
                         self._latest_obs_timing = observation_timing
+                        self._latest_obs_provenance = observation_provenance
             else:
                 # Keep a reference to the raw (unnormalised) observation so we can
                 # capture the joint-state baseline when a new chunk is generated.
@@ -2501,6 +2701,10 @@ class LeRobotInferenceNode(Node):
             # be hidden by a small per-cycle clamp and walk the robot toward the
             # invalid target over repeated cycles.
             raw_controller_action = self.action_limiter.reorder(model_order_action)
+            raw_controller_action = self._saturate_mechanical_stops(
+                current_names,
+                raw_controller_action,
+            )
             raw_controller_action = self._validate_absolute_joint_targets(
                 current_names,
                 raw_controller_action,
@@ -2551,6 +2755,39 @@ class LeRobotInferenceNode(Node):
             self._smooth_tracker.record(processed_full)
         self.metrics.record_action_output()
         self._has_published = True
+
+    def _saturate_mechanical_stops(
+        self,
+        joint_names: list[str],
+        targets: np.ndarray,
+    ) -> np.ndarray:
+        """Clamp configured targets to hard limits inside a bounded margin."""
+        if not self._saturate_joint_targets:
+            return targets
+
+        targets = np.asarray(targets, dtype=np.float64).reshape(-1).copy()
+        for index, joint_name in enumerate(joint_names):
+            if joint_name not in self._saturate_joint_targets:
+                continue
+            lower, upper = self._joint_position_limits[joint_name]
+            target = targets[index]
+            if lower <= target <= upper:
+                continue
+            margin = self._saturate_joint_margins[joint_name]
+            if target < lower - margin or target > upper + margin:
+                # Leave larger violations untouched so the absolute validator
+                # latches instead of silently accepting an impossible target.
+                continue
+            targets[index] = float(np.clip(target, lower, upper))
+            previous = self._saturation_counts.get(joint_name, 0)
+            self._saturation_counts[joint_name] = previous + 1
+            if previous == 0:
+                self.get_logger().warn(
+                    f"[SATURATE] {joint_name}={target:.9f} clamped to "
+                    f"[{lower:.9f}, {upper:.9f}] within margin {margin:.9f}; "
+                    "further clamps are counted in the stats block"
+                )
+        return targets
 
     def _validate_absolute_joint_targets(
         self,
@@ -2681,6 +2918,11 @@ class LeRobotInferenceNode(Node):
         """Log model-agnostic stats shared across all model types."""
         logger.info(f"  Inference FPS{inference_hz:7.1f} Hz  ({stats['inference_count']} total)")
         logger.info(f"  Action FPS   {action_output_hz:7.1f} Hz")
+        for joint_name in sorted(self._saturation_counts):
+            logger.info(
+                f"  Saturated    {self._saturation_counts[joint_name]:7d}    "
+                f"{joint_name}"
+            )
         if hasattr(self, "_latency_tracker"):
             lat_mean = self._latency_tracker.mean()
             lat_std = self._latency_tracker.std()

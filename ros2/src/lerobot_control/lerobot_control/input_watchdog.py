@@ -19,6 +19,15 @@ class SensorReading:
     name: str
     sequence: int
     last_seen_monotonic: float | None
+    ros_timestamp: float | None = None
+
+
+@dataclass(frozen=True)
+class ObservationProvenance:
+    """Exact sensor samples consumed to construct one policy observation."""
+
+    joint_state: SensorReading
+    cameras: tuple[SensorReading, ...]
 
 
 @dataclass(frozen=True)

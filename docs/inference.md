@@ -142,9 +142,12 @@ inference_tuning:
 diagnostics:
   rtc_timing: false
   rtc_cuda_events: false
+  rtc_provenance: false
   # Enable only in a reviewed shadow profile. The node emits correlated
   # per-stage wall timings and queries CUDA events asynchronously, without
   # synchronizing the inference stream or changing readiness calculations.
+  # rtc_provenance additionally records the exact joint/camera counters,
+  # ROS header stamps, receipt ages and a digest/summary of each action chunk.
 ```
 
 **Joint-state process isolation:** the `joint_state_worker` launch
@@ -163,6 +166,12 @@ safety:
   # Hard limit on joint position change per control step (radians).
   min_position_delta: null
   joint_limit_tolerance: 0.000001
+  saturate_joint_targets: []
+  saturate_joint_margins: {}
+  # Optional bounded acceptance for known recording artefacts. Every named
+  # joint requires an explicit positive margin no larger than 0.05 rad.
+  # Targets inside the margin clamp to the existing hard limit and are counted;
+  # larger violations still fail closed.
   joint_position_limits:
     # Required full mapping keyed by exact ROS joint names. See the default
     # config for all 16 values sourced from the deployed robot URDF.
@@ -175,10 +184,19 @@ delta limiter can hide an invalid raw target, and once more on the final
 command. The node prepares and validates both arms before publishing either
 one, so a bad target on the right arm cannot leave a left-only command behind.
 Missing, extra, inverted, or non-finite limit entries abort startup.
-Targets outside the configured limit plus the numerical tolerance always fail
-closed. The runtime does not provide a diagnostic mode that clips arbitrary
-model targets into range; correcting the policy or its normalization cannot be
-replaced by a permissive deployment setting.
+Targets outside the configured limit plus the numerical tolerance fail closed
+unless that exact joint has a bounded saturation margin. Saturation never
+expands the hard limit: accepted overshoot is clamped to the existing bound,
+counted in the periodic statistics and limited to 0.05 rad. It is intended only
+for measured recording artefacts and cannot replace correcting the dataset or
+policy. See `inference_envelope_afo.yaml` for a profile whose margins document
+the checkpoint statistics from which they were derived.
+
+`inference_default_afo.yaml` provides the three-camera AFO feature mapping
+(`base`, `left_wrist`, `right_wrist`). `inference_envelope_afo.yaml` extends it
+with the envelope task prompt, measured RTC settings, watchdog limits, bounded
+saturation and opt-in latency/provenance diagnostics. Neither profile contains
+a checkpoint path; pass that separately at launch time.
 
 **Fail-closed input watchdog:**
 ```yaml

@@ -25,7 +25,12 @@ from ..image_worker import (
     run_image_worker,
     run_joint_state_worker,
 )
-from ..input_watchdog import InputSnapshot, ObservationSequence, SensorReading
+from ..input_watchdog import (
+    InputSnapshot,
+    ObservationProvenance,
+    ObservationSequence,
+    SensorReading,
+)
 from ..shared_image_buffer import SharedImageBuffer, SharedJointStateBuffer
 
 JOINT_STATE_BUFFER_NAME = "lerobot_joint_state"
@@ -68,6 +73,7 @@ class MultiProcessStrategy:
         self._joint_errors: tuple[str, ...] = ()
         self._last_observation_sequence: ObservationSequence | None = None
         self._last_observation_monotonic: float | None = None
+        self._last_observation_provenance: ObservationProvenance | None = None
         self._max_sensor_skew_sec: float = 0.10
         self._joint_state_worker_enabled = False
         self._joint_state_topic = ""
@@ -391,6 +397,7 @@ class MultiProcessStrategy:
             )
             joint_efforts = dict(self._joint_efforts) if self._joint_efforts is not None else None
             joint_received_monotonic = self._joint_received_monotonic
+            joint_ros_timestamp = self._joint_timestamp
             joint_errors = self._joint_errors
 
         if joint_received_monotonic is None or not math.isfinite(joint_received_monotonic):
@@ -489,6 +496,28 @@ class MultiProcessStrategy:
         self._last_observation_monotonic = min(
             [joint_received_monotonic, *camera_received_by_name.values()]
         )
+        self._last_observation_provenance = ObservationProvenance(
+            joint_state=SensorReading(
+                name="joint_states",
+                sequence=joint_sequence,
+                last_seen_monotonic=joint_received_monotonic,
+                ros_timestamp=joint_ros_timestamp,
+            ),
+            cameras=tuple(
+                SensorReading(
+                    name=f"camera:{camera_name}",
+                    sequence=frame_counter,
+                    last_seen_monotonic=received_monotonic,
+                    ros_timestamp=ros_timestamp,
+                )
+                for camera_name, (
+                    _image,
+                    ros_timestamp,
+                    frame_counter,
+                    received_monotonic,
+                ) in sorted(images.items())
+            ),
+        )
         self._last_consumed_joint_sequence = joint_sequence
         self._last_incomplete_reason = ""
         return observation
@@ -563,6 +592,10 @@ class MultiProcessStrategy:
     def get_last_observation_monotonic(self) -> float | None:
         """Return the oldest exact input receipt time in the last observation."""
         return self._last_observation_monotonic
+
+    def get_last_observation_provenance(self) -> ObservationProvenance | None:
+        """Return the exact ROS stamps, counters and receipt times consumed."""
+        return self._last_observation_provenance
 
     def get_input_snapshot(self, camera_names: list[str]) -> InputSnapshot:
         """Return freshness metadata without consuming any sensor sample."""
