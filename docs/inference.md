@@ -18,6 +18,7 @@ cp .env.example .env
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `MODEL_PATH` | Yes (inference) | Host path to checkpoint dir. Must be absolute or start with `./` — bare relative paths are treated as Docker named volumes. |
+| `IMAGE_TAG` | Yes (deployment) | Runtime image for the deployed code branch. Reuse the same tag for every checkpoint evaluated with that branch; checkpoint identity belongs in `MODEL_PATH`, not in the image tag. |
 | `ROS_DOMAIN_ID` | Yes | ROS2 domain ID — must match the Anvil Devbox. Leave empty for localhost-only. |
 | `CYCLONEDDS_URI` | Yes | Path to CycloneDDS XML config (e.g. `configs/cyclonedds/two_pc_gpu.xml`). |
 | `LEROBOT_EXTRAS` | VLA only | Comma-separated policy extras built into the Docker image — e.g. `smolvla`, `pi,smolvla`. **Rebuild the image after changing:** `docker compose build`. ACT and Diffusion leave this empty. |
@@ -30,6 +31,30 @@ cp .env.example .env
 | `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS` | No | Native CPU thread-pool limits (default: `4`). These prevent the inference process and spawned camera workers from oversubscribing the host and delaying CUDA work. |
 
 For full descriptions and defaults, see [`.env.example`](../.env.example).
+
+### Image and checkpoint lifecycle
+
+Build one image for each code branch or reviewed runtime revision. Do not build
+or tag an image per training run, experiment, or checkpoint. Checkpoints are
+mounted read-only through `MODEL_PATH`, so switching models only recreates the
+container with a different bind mount:
+
+```bash
+# Once, after checking out or changing runtime code/dependencies
+IMAGE_TAG=fix-inference-provenance-saturation docker compose build inference
+
+# For each checkpoint; no image rebuild
+IMAGE_TAG=fix-inference-provenance-saturation \
+MODEL_PATH=/absolute/path/to/checkpoint \
+docker compose up -d inference
+```
+
+Rebuild only after code, the Dockerfile, `LEROBOT_VERSION`, or
+`LEROBOT_EXTRAS` changes. Stop real-hardware inference before building or
+running other GPU-heavy validation on the inference workstation: resource
+contention can trip the temporal watchdog. Record both the image tag or source
+commit and `MODEL_PATH` for every evaluation so the result remains
+reproducible.
 
 ### Script Flags
 
@@ -67,16 +92,19 @@ If `Control Loop` hits 30 Hz, the setup is ready for real hardware.
 ## Production (Real Robot)
 
 ```bash
-# Standard inference
+# Build once after changing the branch runtime
+docker compose build inference
+
+# Standard inference; changing MODEL_PATH does not require --build
 MODEL_PATH=$(pwd)/model_zoo/my-task/checkpoints/last \
-./scripts/run_inference.sh up --build
+./scripts/run_inference.sh up
 
 # With inference monitor
 MODEL_PATH=$(pwd)/model_zoo/my-task/checkpoints/last \
-./scripts/run_inference.sh --monitor-enable up --build
+./scripts/run_inference.sh --monitor-enable up
 
 # Verify DDS connectivity without a checkpoint
-./scripts/run_inference.sh --echo-topic-only up --build
+./scripts/run_inference.sh --echo-topic-only up
 ```
 
 > **`MODEL_PATH` must be absolute or start with `./`.** Bare relative paths are treated as named Docker volumes.
