@@ -72,6 +72,7 @@ def _strategy_with_joint_sample(
         "state_features": ["position"],
     }
     strategy._joint_positions = {"follower_l_joint1": 1.25}
+    strategy._joint_timestamp = 123.456
     strategy._joint_received_monotonic = joint_received
     strategy._joint_sequence = 1
     strategy._max_sensor_skew_sec = max_sensor_skew
@@ -112,6 +113,18 @@ def test_observation_source_is_oldest_exact_consumed_input_during_metadata_race(
         ("base", 1),
         ("left_wrist", 2),
         ("right_wrist", 3),
+    )
+    provenance = strategy.get_last_observation_provenance()
+    assert provenance.joint_state.sequence == 1
+    assert provenance.joint_state.ros_timestamp == 123.456
+    assert provenance.joint_state.last_seen_monotonic == joint_received
+    assert tuple(
+        (reading.name, reading.sequence, reading.ros_timestamp, reading.last_seen_monotonic)
+        for reading in provenance.cameras
+    ) == (
+        ("camera:base", 1, 101.0, camera_received[0]),
+        ("camera:left_wrist", 2, 102.0, camera_received[1]),
+        ("camera:right_wrist", 3, 103.0, camera_received[2]),
     )
     assert image_buffer.metadata_reads == 0
 

@@ -1,0 +1,201 @@
+# =============================================================================
+# LeRobot Inference Configuration
+# =============================================================================
+# Parameters set via ROS2 launch args (not in this file):
+#   model_path, device, control_frequency, image_height/width, echo_topic_only
+#
+# Model type and training flags are auto-read from the checkpoint.
+# Only set fields here to override checkpoint values or provide runtime config.
+
+# -----------------------------------------------------------------------------
+# Model
+# -----------------------------------------------------------------------------
+model:
+  # VLA task prompt — required for SmolVLA / Pi0 / Pi0.5, ignored for ACT / Diffusion
+  # Set to the task the model was trained/finetuned for.
+  task_description: null
+  # Verify checkpoint_manifest.sha256 or SHA256SUMS.expected before allocating
+  # the model. Keep true for real-robot inference.
+  require_checkpoint_manifest: true
+
+diagnostics:
+  rtc_timing: false
+  rtc_cuda_events: false
+  rtc_provenance: false
+
+# -----------------------------------------------------------------------------
+# Inference Tuning (per model type)
+# -----------------------------------------------------------------------------
+# Override checkpoint defaults. null = use the value the model was trained with.
+# Only the section matching your model type is used; others are ignored.
+
+inference_tuning:
+
+  # ACT — lightweight transformer, single forward pass per chunk
+  act:
+    # n_action_steps: steps to execute before re-running inference.
+    #   Tuning: jittery → raise; hesitates → lower; GPU slow → lower
+    n_action_steps: null
+    # temporal_ensemble_coeff: re-infers every step, exponentially weights
+    #   overlapping predictions. Use 0.01 (paper default). Forces n_action_steps=1.
+    temporal_ensemble_coeff: null
+
+  # Diffusion — iterative denoising (UNet)
+  diffusion:
+    n_action_steps: null
+    # num_inference_steps: denoising steps at inference time.
+    #   Default (null) = num_train_timesteps (100). Set 10 for real-time (78ms vs 711ms).
+    num_inference_steps: 10
+
+  # RTC — VLA models only (pi0, pi0.5, smolvla), always enabled
+  #   Background thread runs inference continuously; control loop reads from ActionQueue.
+  rtc:
+    # inference_delay: fallback step-count for first inference before LatencyTracker kicks in.
+    #   Real-robot tuned: ceil(~330ms × 30Hz) ≈ 10. Auto-adjusted after first inference.
+    inference_delay: 10
+    # queue_trigger_threshold: re-trigger inference when queue depth ≤ this.
+    #   Set equal to chunk_size for maximum RTC overlap.
+    queue_trigger_threshold: 50
+    # execution_horizon: steps used from each chunk before re-inferring.
+    #   Higher → less frequent inference, slower reaction. Lower → faster reaction.
+    execution_horizon: 12
+    max_guidance_weight: 10.0
+    prefix_attention_schedule: EXP
+    # Fail-closed RTC readiness proof. After one discarded cold forward and one
+    # unpublished seed, exactly five guided refills must pass queue, age, and
+    # useful-overlap bounds. Two steps cover measured latency variation, one
+    # step covers queue-index phase, and one reserves scheduler jitter. At least
+    # three guided steps must survive those bounds.
+    readiness_guided_forwards: 5
+    readiness_latency_guard_steps: 2
+    readiness_index_phase_tolerance_steps: 1
+    readiness_scheduler_guard_steps: 1
+    readiness_min_guided_overlap_steps: 3
+
+# -----------------------------------------------------------------------------
+# Joint Configuration
+# -----------------------------------------------------------------------------
+joint_state_topic: "/joint_states"
+
+joint_names:
+  # Joint order as output by ML model (must match training dataset)
+  model_joint_order:
+    - finger_joint1
+    - joint1
+    - joint2
+    - joint3
+    - joint4
+    - joint5
+    - joint6
+    - joint7
+
+  # Joint order expected by ROS2 forward_position_controller
+  controller_joint_order:
+    - joint1
+    - joint2
+    - joint3
+    - joint4
+    - joint5
+    - joint6
+    - joint7
+    - finger_joint1
+
+  # arm_mapping controls how observation.state is assembled:
+  #   Keys are used in joint name lookup: f"{observation_prefix}_{arm_key}_{joint_id}"
+  #   For bimanual Anvil robot: {l: left, r: right} → 2×8 = 16 DOF state
+  #   For pi05_libero_finetuned (single-arm, 8 DOF): use only one arm below.
+  arm_mapping:
+    l: left
+    r: right
+
+  # Anvil bimanual model uses position + velocity + effort as state inputs
+  state_features:
+    - position
+
+# -----------------------------------------------------------------------------
+# Arm Configuration
+# -----------------------------------------------------------------------------
+# ML model outputs: action = [left_joints..., right_joints...]
+# Split and publish to separate controller topics
+
+arms:
+  left:
+    ros_prefix: "follower_l"
+    command_topic: "/follower_l_forward_position_controller/commands"
+    action_start: 0
+    action_end: 8
+  right:
+    ros_prefix: "follower_r"
+    command_topic: "/follower_r_forward_position_controller/commands"
+    action_start: 8
+    action_end: 16
+
+# -----------------------------------------------------------------------------
+# Camera Configuration
+# -----------------------------------------------------------------------------
+
+cameras:
+  # fps: expected publish rate; warning fires when any camera drops below fps * 2/3.
+  #   Independent of control_frequency.
+  fps: 30.0
+
+  # mapping: ROS topic -> ML model camera name (must match training config)
+  mapping:
+    "/cam_wrist_r/image_raw/compressed": "right_wrist"
+    "/cam_chest/image_raw/compressed": "base"
+    "/cam_wrist_l/image_raw/compressed": "left_wrist"
+
+  # fps_overrides: per-topic overrides for cameras running at a different rate.
+  #   Omit topics that match the global fps above.
+  # fps_overrides:
+  #   "/cam_wrist_r/image_raw/compressed": 60.0
+
+# -----------------------------------------------------------------------------
+# Safety Parameters
+# -----------------------------------------------------------------------------
+# max_position_delta: maximum joint position change per step (radians).
+# min_position_delta: minimum per-joint change required to publish a new command (radians).
+#   Use to overcome motor friction when model delta outputs are too small to move joints.
+#   Commands are held at last published value until cumulative change exceeds this threshold.
+#   Default: disabled (null). Recommended starting value: 0.05.
+safety:
+  max_position_delta: 0.1
+  min_position_delta: null
+  # Numerical comparison tolerance only. It may not exceed 1e-6 rad.
+  joint_limit_tolerance: 0.000001
+  # Absolute URDF limits keyed by the exact JointState/controller joint name.
+  # This mapping must exactly cover all 16 commanded joints or startup aborts.
+  joint_position_limits:
+    follower_l_finger_joint1: [0.0, 0.05]
+    follower_l_joint1: [-2.3562, 2.3562]
+    follower_l_joint2: [-3.3161, 0.1745]
+    follower_l_joint3: [-1.570796, 1.570796]
+    follower_l_joint4: [0.0, 2.443461]
+    follower_l_joint5: [-1.570796, 1.570796]
+    follower_l_joint6: [-0.785398, 0.785398]
+    follower_l_joint7: [-1.570796, 1.570796]
+    follower_r_finger_joint1: [0.0, 0.05]
+    follower_r_joint1: [-2.3562, 2.3562]
+    follower_r_joint2: [-0.1745, 3.3161]
+    follower_r_joint3: [-1.570796, 1.570796]
+    follower_r_joint4: [0.0, 2.443461]
+    follower_r_joint5: [-1.570796, 1.570796]
+    follower_r_joint6: [-0.785398, 0.785398]
+    follower_r_joint7: [-1.570796, 1.570796]
+
+# Input watchdog — fail-closed and enabled for every inference run.
+# A missing/stale input, non-advancing observation, sensor skew, invalid joint
+# value, inference exception, or invalid action latches publication off. The
+# node never auto-resumes: after fixing the input, restart the node or call
+#   ros2 service call /lerobot_inference/rearm_watchdog std_srvs/srv/Trigger '{}'
+watchdog:
+  # Local monotonic time since receipt; independent of ROS/system clock jumps.
+  camera_timeout_sec: 0.25
+  joint_state_timeout_sec: 0.10
+  # Maximum difference between local receipt times in one sensor set.
+  max_sensor_skew_sec: 0.10
+  # Maximum time an action may remain based on the last accepted observation.
+  # Pi0.5 inference observed at ~0.55–0.59 s; keep margin above normal latency.
+  max_action_age_sec: 1.50
+  # Allows drivers and image worker processes to start before latching missing inputs.
+  startup_grace_sec: 10.0

@@ -18,6 +18,7 @@ cp .env.example .env
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `MODEL_PATH` | Yes (inference) | Host path to checkpoint dir. Must be absolute or start with `./` — bare relative paths are treated as Docker named volumes. |
+| `IMAGE_TAG` | Yes (deployment) | Runtime image for the deployed code branch. Reuse the same tag for every checkpoint evaluated with that branch; checkpoint identity belongs in `MODEL_PATH`, not in the image tag. |
 | `ROS_DOMAIN_ID` | Yes | ROS2 domain ID — must match the Anvil Devbox. Leave empty for localhost-only. |
 | `CYCLONEDDS_URI` | Yes | Path to CycloneDDS XML config (e.g. `configs/cyclonedds/two_pc_gpu.xml`). |
 | `LEROBOT_EXTRAS` | VLA only | Comma-separated policy extras built into the Docker image — e.g. `smolvla`, `pi,smolvla`. **Rebuild the image after changing:** `docker compose build`. ACT and Diffusion leave this empty. |
@@ -30,6 +31,30 @@ cp .env.example .env
 | `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS` | No | Native CPU thread-pool limits (default: `4`). These prevent the inference process and spawned camera workers from oversubscribing the host and delaying CUDA work. |
 
 For full descriptions and defaults, see [`.env.example`](../.env.example).
+
+### Image and checkpoint lifecycle
+
+Build one image for each code branch or reviewed runtime revision. Do not build
+or tag an image per training run, experiment, or checkpoint. Checkpoints are
+mounted read-only through `MODEL_PATH`, so switching models only recreates the
+container with a different bind mount:
+
+```bash
+# Once, after checking out or changing runtime code/dependencies
+IMAGE_TAG=fix-inference-provenance-saturation docker compose build inference
+
+# For each checkpoint; no image rebuild
+IMAGE_TAG=fix-inference-provenance-saturation \
+MODEL_PATH=/absolute/path/to/checkpoint \
+docker compose up -d inference
+```
+
+Rebuild only after code, the Dockerfile, `LEROBOT_VERSION`, or
+`LEROBOT_EXTRAS` changes. Stop real-hardware inference before building or
+running other GPU-heavy validation on the inference workstation: resource
+contention can trip the temporal watchdog. Record both the image tag or source
+commit and `MODEL_PATH` for every evaluation so the result remains
+reproducible.
 
 ### Script Flags
 
@@ -67,16 +92,19 @@ If `Control Loop` hits 30 Hz, the setup is ready for real hardware.
 ## Production (Real Robot)
 
 ```bash
-# Standard inference
+# Build once after changing the branch runtime
+docker compose build inference
+
+# Standard inference; changing MODEL_PATH does not require --build
 MODEL_PATH=$(pwd)/model_zoo/my-task/checkpoints/last \
-./scripts/run_inference.sh up --build
+./scripts/run_inference.sh up
 
 # With inference monitor
 MODEL_PATH=$(pwd)/model_zoo/my-task/checkpoints/last \
-./scripts/run_inference.sh --monitor-enable up --build
+./scripts/run_inference.sh --monitor-enable up
 
 # Verify DDS connectivity without a checkpoint
-./scripts/run_inference.sh --echo-topic-only up --build
+./scripts/run_inference.sh --echo-topic-only up
 ```
 
 > **`MODEL_PATH` must be absolute or start with `./`.** Bare relative paths are treated as named Docker volumes.
@@ -142,9 +170,12 @@ inference_tuning:
 diagnostics:
   rtc_timing: false
   rtc_cuda_events: false
+  rtc_provenance: false
   # Enable only in a reviewed shadow profile. The node emits correlated
   # per-stage wall timings and queries CUDA events asynchronously, without
   # synchronizing the inference stream or changing readiness calculations.
+  # rtc_provenance additionally records the exact joint/camera counters,
+  # ROS header stamps, receipt ages and a digest/summary of each action chunk.
 ```
 
 **Joint-state process isolation:** the `joint_state_worker` launch
@@ -157,12 +188,34 @@ it directly; a live profile must additionally set
 changing only a topic name.
 
 **Safety limits:**
+
+Absolute software ranges are currently disabled by default while the deployed
+URDF ranges are reconciled with measured encoder positions. They can be enabled
+without changing the image or checkpoint:
+
+```bash
+ENFORCE_JOINT_POSITION_LIMITS=true docker compose up inference
+```
+
+When disabled, only configured absolute-range saturation and rejection are
+bypassed. Action shape and finite-value validation, current-joint feedback, the
+fail-closed input and RTC watchdogs, and `max_position_delta` remain active.
+Startup logs emit a prominent warning while absolute ranges are disabled. The
+deployed robot limits should still be corrected and validated before enabling
+unattended operation.
+
 ```yaml
 safety:
   max_position_delta: 0.1
   # Hard limit on joint position change per control step (radians).
   min_position_delta: null
   joint_limit_tolerance: 0.000001
+  saturate_joint_targets: []
+  saturate_joint_margins: {}
+  # Optional bounded acceptance for known recording artefacts. Every named
+  # joint requires an explicit positive margin no larger than 0.05 rad.
+  # Targets inside the margin clamp to the existing hard limit and are counted;
+  # larger violations still fail closed.
   joint_position_limits:
     # Required full mapping keyed by exact ROS joint names. See the default
     # config for all 16 values sourced from the deployed robot URDF.
@@ -175,10 +228,19 @@ delta limiter can hide an invalid raw target, and once more on the final
 command. The node prepares and validates both arms before publishing either
 one, so a bad target on the right arm cannot leave a left-only command behind.
 Missing, extra, inverted, or non-finite limit entries abort startup.
-Targets outside the configured limit plus the numerical tolerance always fail
-closed. The runtime does not provide a diagnostic mode that clips arbitrary
-model targets into range; correcting the policy or its normalization cannot be
-replaced by a permissive deployment setting.
+Targets outside the configured limit plus the numerical tolerance fail closed
+unless that exact joint has a bounded saturation margin. Saturation never
+expands the hard limit: accepted overshoot is clamped to the existing bound,
+counted in the periodic statistics and limited to 0.05 rad. It is intended only
+for measured recording artefacts and cannot replace correcting the dataset or
+policy. See `inference_envelope_afo.yaml` for a profile whose margins document
+the checkpoint statistics from which they were derived.
+
+`inference_default_afo.yaml` provides the three-camera AFO feature mapping
+(`base`, `left_wrist`, `right_wrist`). `inference_envelope_afo.yaml` extends it
+with the envelope task prompt, measured RTC settings, watchdog limits, bounded
+saturation and opt-in latency/provenance diagnostics. Neither profile contains
+a checkpoint path; pass that separately at launch time.
 
 **Fail-closed input watchdog:**
 ```yaml
