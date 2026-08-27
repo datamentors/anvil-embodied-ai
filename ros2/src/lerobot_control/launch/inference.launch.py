@@ -34,6 +34,15 @@ def generate_launch_description():
         "control_frequency", default_value="30.0", description="Control loop frequency (Hz)"
     )
 
+    enforce_joint_position_limits_arg = DeclareLaunchArgument(
+        "enforce_joint_position_limits",
+        default_value="true",
+        description=(
+            "Validate and clamp commands against configured absolute joint limits. "
+            "Disable only for an attended evaluation with independent hardware limits."
+        ),
+    )
+
     deterministic_arg = DeclareLaunchArgument(
         "deterministic", default_value="false", description="Enable deterministic mode"
     )
@@ -83,6 +92,9 @@ def generate_launch_description():
                 "model_path": LaunchConfiguration("model_path"),
                 "config_file": LaunchConfiguration("config_file"),
                 "control_frequency": LaunchConfiguration("control_frequency"),
+                "enforce_joint_position_limits": LaunchConfiguration(
+                    "enforce_joint_position_limits"
+                ),
                 "device": LaunchConfiguration("device"),
                 "deterministic": LaunchConfiguration("deterministic"),
                 "deterministic_seed": LaunchConfiguration("deterministic_seed"),
@@ -101,6 +113,7 @@ def generate_launch_description():
             config_file_arg,
             device_arg,
             control_freq_arg,
+            enforce_joint_position_limits_arg,
             deterministic_arg,
             deterministic_seed_arg,
             echo_topic_only_arg,

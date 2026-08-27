@@ -272,6 +272,7 @@ class LeRobotInferenceNode(Node):
         self.declare_parameter("model_path", "")
         self.declare_parameter("config_file", "")
         self.declare_parameter("control_frequency", 30.0)
+        self.declare_parameter("enforce_joint_position_limits", True)
         self.declare_parameter("device", "cuda")
         self.declare_parameter("deterministic", False)
         self.declare_parameter("deterministic_seed", 42)
@@ -292,6 +293,13 @@ class LeRobotInferenceNode(Node):
             raise ValueError("model_path parameter is required")
 
         self.control_freq = self.get_parameter("control_frequency").value
+        self._enforce_joint_position_limits = self.get_parameter(
+            "enforce_joint_position_limits"
+        ).value
+        if not isinstance(self._enforce_joint_position_limits, bool):
+            raise ValueError(
+                "enforce_joint_position_limits parameter must be a boolean"
+            )
         self.device = self.get_parameter("device").value
         if not math.isfinite(self.control_freq) or self.control_freq <= 0:
             raise ValueError("control_frequency must be finite and > 0")
@@ -765,6 +773,13 @@ class LeRobotInferenceNode(Node):
         logger.info(f"Frequency:  {self.control_freq} Hz")
         if not self.echo_topic_only:
             logger.info(f"Max delta:  {self.max_position_delta} rad")
+            if self._enforce_joint_position_limits:
+                logger.info("Joint limits: ENFORCED (configured absolute ranges)")
+            else:
+                logger.warn(
+                    "Joint limits: DISABLED for attended evaluation; commands are "
+                    "not clamped or rejected by configured absolute ranges"
+                )
             logger.info(
                 "Watchdog:  fail-closed "
                 f"(camera={self._watchdog_camera_timeout_sec:.3f}s, "
@@ -2762,7 +2777,10 @@ class LeRobotInferenceNode(Node):
         targets: np.ndarray,
     ) -> np.ndarray:
         """Clamp configured targets to hard limits inside a bounded margin."""
-        if not self._saturate_joint_targets:
+        if (
+            not self._enforce_joint_position_limits
+            or not self._saturate_joint_targets
+        ):
             return targets
 
         targets = np.asarray(targets, dtype=np.float64).reshape(-1).copy()
@@ -2805,6 +2823,9 @@ class LeRobotInferenceNode(Node):
             )
         if not np.all(np.isfinite(targets)):
             raise ValueError(f"{stage} joint target is non-finite")
+
+        if not self._enforce_joint_position_limits:
+            return targets
 
         for index, (joint_name, target) in enumerate(
             zip(joint_names, targets, strict=True)

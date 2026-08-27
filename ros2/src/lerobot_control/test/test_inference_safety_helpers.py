@@ -388,6 +388,7 @@ def make_two_arm_node() -> LeRobotInferenceNode:
     node.strategy = SimpleNamespace(get_current_joint_positions=lambda: positions)
     node._joint_position_limits = dict.fromkeys(positions, (-1.0, 1.0))
     node._joint_limit_tolerance = 1e-6
+    node._enforce_joint_position_limits = True
     node._saturate_joint_targets = frozenset()
     node._saturate_joint_margins = {}
     node._saturation_counts = {}
@@ -1521,6 +1522,7 @@ def test_duplicate_camera_feature_mapping_is_rejected() -> None:
         "model_path": "",
         "config_file": "unused.yaml",
         "control_frequency": 30.0,
+        "enforce_joint_position_limits": True,
         "device": "cpu",
         "echo_topic_only": True,
         "debug": False,
@@ -1630,6 +1632,31 @@ def test_saturation_past_margin_still_fails_closed() -> None:
     assert node.arm_publishers["left"].messages == []
     assert node.arm_publishers["right"].messages == []
     assert node._saturation_counts == {}
+
+
+def test_disabled_joint_ranges_publish_unclamped_target() -> None:
+    node = make_two_arm_node()
+    node._enforce_joint_position_limits = False
+    node._saturate_joint_targets = frozenset({"follower_r_joint2"})
+    node._saturate_joint_margins = {"follower_r_joint2": 0.02}
+
+    node._publish_action(np.array([0.1, 0.2, 0.3, 1.5]))
+
+    assert node.arm_publishers["left"].messages == [[0.1, 0.2]]
+    assert node.arm_publishers["right"].messages == [[0.3, 1.5]]
+    assert node._saturation_counts == {}
+
+
+def test_disabled_joint_ranges_still_reject_non_finite_target() -> None:
+    node = make_two_arm_node()
+    node._enforce_joint_position_limits = False
+
+    with pytest.raises(ValueError, match="non-finite"):
+        node._validate_absolute_joint_targets(
+            ["follower_l_joint1"],
+            np.array([np.nan]),
+            stage="raw absolute",
+        )
 
 
 @pytest.mark.parametrize("margin", [0.0, -0.01, 0.051, float("nan")])

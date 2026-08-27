@@ -160,6 +160,21 @@ it directly; a live profile must additionally set
 changing only a topic name.
 
 **Safety limits:**
+
+Absolute software ranges are enabled by default. For an attended diagnostic in
+which measured encoder positions are known to exceed a stale URDF range, they
+can be disabled without changing the image or checkpoint:
+
+```bash
+ENFORCE_JOINT_POSITION_LIMITS=false docker compose up inference
+```
+
+This bypasses only configured absolute-range saturation and rejection. Action
+shape and finite-value validation, current-joint feedback, the fail-closed input
+and RTC watchdogs, and `max_position_delta` remain active. Startup logs emit a
+prominent warning while the override is disabled. Do not use the override as a
+replacement for correcting and validating the deployed robot limits.
+
 ```yaml
 safety:
   max_position_delta: 0.1
