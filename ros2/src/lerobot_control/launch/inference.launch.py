@@ -36,7 +36,7 @@ def generate_launch_description():
 
     enforce_joint_position_limits_arg = DeclareLaunchArgument(
         "enforce_joint_position_limits",
-        default_value="true",
+        default_value="false",
         description=(
             "Validate and clamp commands against configured absolute joint limits. "
             "Disable only for an attended evaluation with independent hardware limits."

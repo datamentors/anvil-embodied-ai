@@ -1522,7 +1522,7 @@ def test_duplicate_camera_feature_mapping_is_rejected() -> None:
         "model_path": "",
         "config_file": "unused.yaml",
         "control_frequency": 30.0,
-        "enforce_joint_position_limits": True,
+        "enforce_joint_position_limits": False,
         "device": "cpu",
         "echo_topic_only": True,
         "debug": False,

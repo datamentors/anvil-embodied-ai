@@ -272,7 +272,7 @@ class LeRobotInferenceNode(Node):
         self.declare_parameter("model_path", "")
         self.declare_parameter("config_file", "")
         self.declare_parameter("control_frequency", 30.0)
-        self.declare_parameter("enforce_joint_position_limits", True)
+        self.declare_parameter("enforce_joint_position_limits", False)
         self.declare_parameter("device", "cuda")
         self.declare_parameter("deterministic", False)
         self.declare_parameter("deterministic_seed", 42)

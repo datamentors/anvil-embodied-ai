@@ -161,19 +161,20 @@ changing only a topic name.
 
 **Safety limits:**
 
-Absolute software ranges are enabled by default. For an attended diagnostic in
-which measured encoder positions are known to exceed a stale URDF range, they
-can be disabled without changing the image or checkpoint:
+Absolute software ranges are currently disabled by default while the deployed
+URDF ranges are reconciled with measured encoder positions. They can be enabled
+without changing the image or checkpoint:
 
 ```bash
-ENFORCE_JOINT_POSITION_LIMITS=false docker compose up inference
+ENFORCE_JOINT_POSITION_LIMITS=true docker compose up inference
 ```
 
-This bypasses only configured absolute-range saturation and rejection. Action
-shape and finite-value validation, current-joint feedback, the fail-closed input
-and RTC watchdogs, and `max_position_delta` remain active. Startup logs emit a
-prominent warning while the override is disabled. Do not use the override as a
-replacement for correcting and validating the deployed robot limits.
+When disabled, only configured absolute-range saturation and rejection are
+bypassed. Action shape and finite-value validation, current-joint feedback, the
+fail-closed input and RTC watchdogs, and `max_position_delta` remain active.
+Startup logs emit a prominent warning while absolute ranges are disabled. The
+deployed robot limits should still be corrected and validated before enabling
+unattended operation.
 
 ```yaml
 safety:
