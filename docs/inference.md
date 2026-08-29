@@ -290,6 +290,55 @@ every entry before allocating the model, and verifies that strict state-dict
 loading actually completed. This guards against LeRobot 0.5.1 returning a
 randomly initialized Pi0.5 model after an internal weight-loading error.
 
+## Inference smoothing — RTC vs temporal ensemble
+
+A chunked VLA (Pi0.5) re-plans every few steps; without smoothing the command
+*steps* at each chunk seam (start–stop jerk, worst as the gripper closes). Two
+smoothers are available for VLA models:
+
+- **RTC** (default) — guides the new chunk's prefix to match the executing tail.
+  Continuous, but needs backward passes (`enable_grad`), so it is unavailable on
+  gradient-free serving paths (e.g. sglang base flow).
+- **Temporal ensemble** — keeps the recent chunks in flight and publishes the
+  age-weighted average of every chunk that predicts the current step,
+  `wᵢ = exp(-c·i)` (see `lerobot_control/temporal_ensembler.py`). Pure
+  post-processing, **no gradients** — works on *any* chunk stream, including
+  sglang. Weighting the older/deeper chunk keeps a grasp from restarting shallow.
+
+Select it under `inference_tuning`:
+
+```yaml
+inference_tuning:
+  smoother:
+    type: temporal_ensemble   # omit or 'rtc' => RTC (default, unchanged)
+    coeff: 0.01               # exp(-coeff*age); larger = sharper decay
+    max_chunks: 8             # how many chunks to keep in flight
+    favor_older: true         # weight the deeper chunk (ACT/ROBOTIS behaviour)
+  rtc:
+    # For a clean comparison, run RTC in base flow when using the ensemble so it
+    # blends *unguided* chunks (otherwise you double-smooth).
+    max_guidance_weight: 0.0
+```
+
+> **Status: DRAFT — shadow-validate before live.** When `temporal_ensemble` is
+> set, the node still runs the full RTC queue for **all** watchdog / staleness /
+> authorization checks and only substitutes the published action with the blend.
+> Confirm smoothness on the robot with e-stop in hand before commanding the arms.
+
+### Shadow A/B recipe
+
+Run the **same episode** twice (shadow outputs only) and compare the logged jerk:
+
+```bash
+# A — RTC (baseline): leave `smoother` unset (or type: rtc)
+# B — temporal ensemble: set smoother.type=temporal_ensemble (+ rtc base flow)
+# then compare the DEBUG jerk metric already emitted by the node:
+grep -oE 'jerk=[0-9.]+' deploy/logs/shadow-*.log | sort | tail
+```
+
+Lower `Action D … jerk=` at equal task progress = smoother. Sweep `coeff`
+(0.005–0.05) and `favor_older`.
+
 ## DDS Middleware Selection
 
 Both Fast DDS and CycloneDDS are supported. **CycloneDDS is the default** (faster in our tests).
