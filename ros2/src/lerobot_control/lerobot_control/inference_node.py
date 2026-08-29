@@ -166,6 +166,9 @@ class LeRobotInferenceNode(Node):
         self._classic_chunk_source_monotonic: float | None = None
         self._vla_action_source_monotonic: float | None = None
         self._vla_action_epoch: int | None = None
+        # Optional gradient-free temporal-ensemble smoother (alternative to RTC).
+        # None => RTC only (default, unchanged). Set via inference_tuning.smoother.
+        self._ensembler = None
         # Reference joint state captured at the moment each action chunk was
         # generated (in model/observation order).  All queued steps in the chunk
         # share this reference so delta restoration is consistent with training.
@@ -606,6 +609,22 @@ class LeRobotInferenceNode(Node):
 
         if self._is_vla:
             self.rtc_config_yaml = tuning.get("rtc", {})
+            # Optional alternative smoother: gradient-free temporal ensembling.
+            # Default (no 'smoother' or type != 'temporal_ensemble') => RTC only.
+            # DRAFT: validate in shadow before live; for a clean A/B run RTC in
+            # base flow (no guidance) so the ensembler blends unguided chunks.
+            _sm = tuning.get("smoother", {}) or {}
+            if _sm.get("type") == "temporal_ensemble":
+                from .temporal_ensembler import TemporalEnsembler
+                self._ensembler = TemporalEnsembler(
+                    coeff=float(_sm.get("coeff", 0.01)),
+                    max_chunks=int(_sm.get("max_chunks", 8)),
+                    favor_older=bool(_sm.get("favor_older", True)),
+                )
+                self.get_logger().warn(
+                    "SMOOTHER=temporal_ensemble (DRAFT): publishing the age-weighted "
+                    "blend of recent chunks instead of the RTC-merged action."
+                )
         elif self.model_type == "diffusion":
             diff = tuning.get("diffusion", {})
             if diff.get("n_action_steps") is not None:
@@ -1441,6 +1460,17 @@ class LeRobotInferenceNode(Node):
                 alignment.merge_delay_steps,
                 None,
             )
+            if self._ensembler is not None:
+                # DRAFT: feed the freshly produced chunk to the parallel smoother,
+                # under the same queue lock so add/step stay serialized.
+                _ch = (
+                    processed.detach().to("cpu").numpy()
+                    if hasattr(processed, "detach")
+                    else np.asarray(processed)
+                )
+                if _ch.ndim == 3:
+                    _ch = _ch[0]
+                self._ensembler.add_chunk(_ch)
             queue_size = self._action_queue.qsize()
             expected_queue_size = max(
                 0,
@@ -2354,11 +2384,15 @@ class LeRobotInferenceNode(Node):
                 # authorized, or published.
                 if not self._vla_policy_ready:
                     return
+                _blended = None
                 with self._action_queue_lock:
                     action = self._action_queue.get()
                     queue_size = self._action_queue.qsize()
                     action_source = self._vla_action_source_monotonic
                     action_epoch = self._vla_action_epoch
+                    if self._ensembler is not None:
+                        # advance the smoother in lockstep with the RTC queue
+                        _blended = self._ensembler.step()
                 if self._debug:
                     self._queue_depths.append(queue_size)
                 if action is None:
@@ -2373,6 +2407,11 @@ class LeRobotInferenceNode(Node):
                     if action.dim() > 1:
                         action = action.squeeze(0)
                     action = action.cpu().numpy()
+                if _blended is not None:
+                    # DRAFT smoother: publish the age-weighted blend. The RTC queue
+                    # above still drives ALL watchdog / staleness / authorization;
+                    # only the numeric action is replaced. Validate in shadow first.
+                    action = _blended
             else:
                 if not self._classic_action_deque:
                     return
