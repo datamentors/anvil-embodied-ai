@@ -5,7 +5,8 @@
 # the model_path launch argument. It enables diagnostic-only provenance logging
 # while preserving the reviewed control, RTC and hard-limit behavior.
 #
-# Why bounded saturation exists: the strict profile latches within ~6 s of arming.
+# Bounded saturation is dormant unless ENFORCE_JOINT_POSITION_LIMITS=true.
+# Why it exists when explicitly enabled: the strict profile latches within ~6 s of arming.
 # The envelope-curated-v3_1 recordings hold action values a little outside the
 # URDF limits on 11 of the 16 commanded joints, so the policy reproduces them
 # and _validate_absolute_joint_targets rejects the first one it sees. Three
@@ -182,15 +183,15 @@ cameras:
 # -----------------------------------------------------------------------------
 # Safety Parameters
 # -----------------------------------------------------------------------------
-# max_position_delta: maximum joint position change per step (radians).
+# max_position_delta: optional maximum joint position change per step (radians).
+#   Disabled here so attended checkpoint evaluation publishes the model target
+#   unchanged after denormalization and joint reordering.
 # min_position_delta: minimum per-joint change required to publish a new command (radians).
 #   Use to overcome motor friction when model delta outputs are too small to move joints.
 #   Commands are held at last published value until cumulative change exceeds this threshold.
 #   Default: disabled (null). Recommended starting value: 0.05.
 safety:
-  # Still bounds per-step travel, so a clamp can never turn into a jump: the
-  # largest margin below is 0.042 rad against this 0.1 rad step bound.
-  max_position_delta: 0.1
+  max_position_delta: null
   min_position_delta: null
   # Numerical comparison tolerance only. It may not exceed 1e-6 rad.
   joint_limit_tolerance: 0.000001

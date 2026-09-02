@@ -337,13 +337,17 @@ class LeRobotInferenceNode(Node):
 
         # Fields from YAML config
         safety_config = self.config.get("safety", {})
-        self.max_position_delta = safety_config.get("max_position_delta", 0.1)
+        self.max_position_delta = safety_config.get("max_position_delta")
         self.min_position_delta = safety_config.get("min_position_delta", None)
-        if (
-            not math.isfinite(self.max_position_delta)
-            or self.max_position_delta <= 0
-        ):
-            raise ValueError("safety.max_position_delta must be finite and > 0")
+        if self.max_position_delta is not None:
+            self.max_position_delta = float(self.max_position_delta)
+            if (
+                not math.isfinite(self.max_position_delta)
+                or self.max_position_delta <= 0
+            ):
+                raise ValueError(
+                    "safety.max_position_delta must be null or finite and > 0"
+                )
         if self.min_position_delta is not None and (
             not math.isfinite(self.min_position_delta)
             or self.min_position_delta < 0
@@ -772,7 +776,17 @@ class LeRobotInferenceNode(Node):
         logger.info(f"Device:     {self.device}")
         logger.info(f"Frequency:  {self.control_freq} Hz")
         if not self.echo_topic_only:
-            logger.info(f"Max delta:  {self.max_position_delta} rad")
+            if self.max_position_delta is None:
+                logger.warn(
+                    "Max delta:  DISABLED; publishing denormalized model targets "
+                    "without per-step clamping"
+                )
+            else:
+                logger.info(f"Max delta:  {self.max_position_delta} rad")
+            if self.min_position_delta is None:
+                logger.info("Min delta:  DISABLED")
+            else:
+                logger.info(f"Min delta:  {self.min_position_delta} rad")
             if self._enforce_joint_position_limits:
                 logger.info("Joint limits: ENFORCED (configured absolute ranges)")
             else:
@@ -2712,9 +2726,8 @@ class LeRobotInferenceNode(Node):
 
             # Delta restore is done upstream in _obs_update (chunk-level), so the
             # raw model target is already absolute. Validate it in controller
-            # order *before* delta limiting: otherwise an impossible target can
-            # be hidden by a small per-cycle clamp and walk the robot toward the
-            # invalid target over repeated cycles.
+            # order *before* optional output filters: otherwise an impossible
+            # target can be hidden and never reach the absolute validator.
             raw_controller_action = self.action_limiter.reorder(model_order_action)
             raw_controller_action = self._saturate_mechanical_stops(
                 current_names,

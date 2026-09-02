@@ -1,7 +1,7 @@
-"""Action limiter for safe robot control.
+"""Action preparation for ROS2 position controllers.
 
-Applies delta limiting and joint reordering to actions before publishing
-to ROS2 controllers.
+Reorders model outputs and, only when explicitly configured, applies optional
+action filters before publication.
 """
 
 import numpy as np
@@ -9,17 +9,17 @@ import numpy as np
 
 class ActionLimiter:
     """
-    Applies delta limiting and joint reordering before publishing actions.
+    Reorders actions and applies explicitly configured output filters.
 
     This class handles:
     1. Reordering actions from model joint order to controller joint order
-    2. Applying delta limiting to prevent large joint movements
+    2. Optionally applying delta limiting when a maximum step is configured
     3. Converting delta actions to absolute positions if needed
     """
 
     def __init__(
         self,
-        max_delta: float = 0.1,
+        max_delta: float | None = None,
         min_delta_threshold: float | None = None,
         model_joint_order: list[str] | None = None,
         controller_joint_order: list[str] | None = None,
@@ -30,7 +30,8 @@ class ActionLimiter:
         Initialize action limiter.
 
         Args:
-            max_delta: Maximum position change per step (radians)
+            max_delta: Optional maximum position change per step (radians).
+                ``None`` publishes the model target without step clamping.
             min_delta_threshold: Minimum per-joint change to publish a new command.
                 When set, commands are held at the last published value until the
                 cumulative change exceeds this threshold. Helps overcome motor
@@ -130,7 +131,7 @@ class ActionLimiter:
 
     def apply_delta_limit(self, action: np.ndarray, current_positions: np.ndarray) -> np.ndarray:
         """
-        Apply delta limiting to prevent large joint movements.
+        Apply the optional maximum joint-position change.
 
         Args:
             action: Target action (absolute positions)
@@ -139,7 +140,11 @@ class ActionLimiter:
         Returns:
             Delta-limited action
         """
-        if current_positions is None or len(current_positions) != len(action):
+        if (
+            self.max_delta is None
+            or current_positions is None
+            or len(current_positions) != len(action)
+        ):
             return action
 
         delta = action - current_positions
@@ -154,10 +159,11 @@ class ActionLimiter:
         ref_state: np.ndarray | None = None,
     ) -> np.ndarray:
         """
-        Process action: reorder and apply delta limiting.
+        Process action: reorder and apply any explicitly configured filters.
 
         Delta restore is handled upstream (in inference_node) before actions reach here.
-        This method receives absolute actions and only applies reordering + safety limiting.
+        This method receives absolute actions and applies reordering plus any
+        configured output filters.
 
         Args:
             action: Absolute action (in model joint order), already delta-restored upstream
@@ -166,7 +172,7 @@ class ActionLimiter:
             ref_state: Unused, kept for backward compatibility
 
         Returns:
-            Processed action ready for publishing (in controller order, delta-limited)
+            Processed action ready for publishing (in controller order)
         """
         del joint_order, ref_state  # Backward-compatible, intentionally unused.
         # Reorder from model order to controller order, then use the same
@@ -183,8 +189,9 @@ class ActionLimiter:
         """Apply delta/deadband limiting to a controller-order absolute target."""
         action = action.copy()
 
-        # Apply delta limiting (always against current position for safety)
-        if current_positions is not None:
+        # Step limiting is opt-in. Evaluation profiles leave max_delta unset so
+        # the published target remains the checkpoint's denormalized output.
+        if self.max_delta is not None and current_positions is not None:
             action = self.apply_delta_limit(action, current_positions)
 
         # Deadband: suppress commands whose accumulated pending delta hasn't reached
@@ -224,7 +231,11 @@ class ActionLimiter:
         Returns:
             List of joint indices that exceed max_delta
         """
-        if current_positions is None or len(current_positions) != len(action):
+        if (
+            self.max_delta is None
+            or current_positions is None
+            or len(current_positions) != len(action)
+        ):
             return []
 
         delta = np.abs(action - current_positions)

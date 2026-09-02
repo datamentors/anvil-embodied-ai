@@ -1580,6 +1580,23 @@ def test_deploy_configs_have_complete_valid_urdf_limit_mapping(config_name) -> N
     assert rtc["readiness_min_guided_overlap_steps"] == 3
 
 
+@pytest.mark.parametrize(
+    "config_name",
+    (
+        "inference_default.yaml",
+        "inference_default_afo.yaml",
+        "inference_envelope_afo.yaml",
+        "inference_eval.yaml",
+        "inference_single_arm.yaml",
+    ),
+)
+def test_deploy_configs_do_not_filter_checkpoint_actions(config_name) -> None:
+    config = yaml.safe_load(find_deploy_config(config_name).read_text())
+
+    assert config["safety"]["max_position_delta"] is None
+    assert config["safety"]["min_position_delta"] is None
+
+
 def test_envelope_profile_has_bounded_saturation_and_provenance() -> None:
     config_path = find_deploy_config("inference_envelope_afo.yaml")
     config = yaml.safe_load(config_path.read_text())
@@ -1695,6 +1712,20 @@ def test_controller_order_processing_preserves_normal_process_behavior() -> None
     explicit = limiter.process_controller_order(controller_order, current)
 
     np.testing.assert_allclose(normal, explicit)
+
+
+def test_disabled_step_limit_preserves_denormalized_target() -> None:
+    limiter = ActionLimiter(
+        max_delta=None,
+        model_joint_order=["finger_joint1", "joint1"],
+        controller_joint_order=["joint1", "finger_joint1"],
+    )
+    model_order = np.array([0.05, 1.2])
+    current = np.array([-0.8, 0.0])
+
+    processed = limiter.process(model_order, current)
+
+    np.testing.assert_allclose(processed, np.array([1.2, 0.05]))
 
 
 def test_right_arm_limit_failure_publishes_neither_arm() -> None:

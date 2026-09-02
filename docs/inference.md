@@ -197,17 +197,18 @@ without changing the image or checkpoint:
 ENFORCE_JOINT_POSITION_LIMITS=true docker compose up inference
 ```
 
-When disabled, only configured absolute-range saturation and rejection are
-bypassed. Action shape and finite-value validation, current-joint feedback, the
-fail-closed input and RTC watchdogs, and `max_position_delta` remain active.
-Startup logs emit a prominent warning while absolute ranges are disabled. The
-deployed robot limits should still be corrected and validated before enabling
-unattended operation.
+When disabled, configured absolute-range saturation and rejection are bypassed.
+Action shape and finite-value validation, current-joint feedback, and the
+fail-closed input and RTC watchdogs remain active. Startup logs emit a prominent
+warning while absolute ranges are disabled. The deployed robot limits should
+still be corrected and validated before enabling unattended operation.
 
 ```yaml
 safety:
-  max_position_delta: 0.1
-  # Hard limit on joint position change per control step (radians).
+  # Optional limit on joint position change per control step (radians).
+  # Keep null for faithful checkpoint evaluation; a positive value enables it.
+  max_position_delta: null
+  # Optional accumulated deadband. Keep null for faithful checkpoint evaluation.
   min_position_delta: null
   joint_limit_tolerance: 0.000001
   saturate_joint_targets: []
@@ -223,10 +224,18 @@ safety:
     # ... all remaining configured joints ...
 ```
 
+All committed inference profiles leave both action filters `null`. With
+`ENFORCE_JOINT_POSITION_LIMITS=false` (the Compose default), the runtime does
+not clamp, smooth, saturate, or deadband the checkpoint target: it only
+denormalizes it, reorders it into controller joint order, validates shape and
+finite values, and publishes it. RTC chunk merging remains part of Pi0.5's
+inference algorithm rather than an output safety filter.
+
 Absolute limits are evaluated after model/controller reordering, before the
-delta limiter can hide an invalid raw target, and once more on the final
-command. The node prepares and validates both arms before publishing either
-one, so a bad target on the right arm cannot leave a left-only command behind.
+optional step limiter can hide an invalid raw target, and once more on the
+final command. The node prepares and validates both arms before publishing
+either one, so a bad target on the right arm cannot leave a left-only command
+behind.
 Missing, extra, inverted, or non-finite limit entries abort startup.
 Targets outside the configured limit plus the numerical tolerance fail closed
 unless that exact joint has a bounded saturation margin. Saturation never
