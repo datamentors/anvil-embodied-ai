@@ -599,6 +599,9 @@ class BufferedStreamExtractor:
         # _buffer_action_command() and is NOT evicted by the sliding buffer
         # window, so a command published long ago can still be reused.
         self._last_known_action: Dict[str, np.ndarray] = {}
+        # Timestamp of each entry in _last_known_action, so action_max_age_s can
+        # bound how stale a held-forward command is allowed to be.
+        self._last_known_action_ts: Dict[str, float] = {}
 
         # Per-robot, per-episode gap-fill counters, keyed by robot then by
         # one of "exact" | "hold_last" | "fallback_to_observation" | "dropped".
@@ -1049,6 +1052,34 @@ class BufferedStreamExtractor:
 
             return result
 
+    def _find_last_at_or_before(
+        self,
+        buffer: deque,
+        target_ts: float,
+    ) -> Optional[int]:
+        """
+        Index of the newest entry published at or before target_ts.
+
+        Unlike _find_nearest_in_buffer this never looks forward. A command
+        published after an observation cannot have influenced that observation,
+        so using it would leak future information into the action.
+
+        Args:
+            buffer: Deque of (timestamp, ...) tuples, monotonic in timestamp
+            target_ts: Observation timestamp
+
+        Returns:
+            Index of the newest entry at or before target_ts, or None when every
+            entry in the buffer is newer than it.
+        """
+        idx = None
+        for i, item in enumerate(buffer):
+            if item[0] <= target_ts:
+                idx = i
+            else:
+                break
+        return idx
+
     def _find_nearest_in_buffer(
         self,
         buffer: deque,
@@ -1095,10 +1126,16 @@ class BufferedStreamExtractor:
         when the arm is disengaged (no live command in the sliding buffer).
 
         Fallback order:
-        1. Nearest command in the live buffer ("exact").
-        2. Last command ever published for this robot, regardless of how long
-           ago ("hold_last") — the arm physically holds its last commanded
-           position when idle, so this reflects reality.
+        1. A command from the live buffer ("exact"). Which one depends on
+           config.action_match: "nearest" picks the closest in absolute time
+           (and may therefore sit AFTER the observation); "causal" picks the
+           newest one at or before it. Either way, when config.action_max_age_s
+           is set the command must be no older than that, otherwise it is
+           tallied as "stale" and the tiers below apply.
+        2. Last command published for this robot ("hold_last") — the arm
+           physically holds its last commanded position when idle, so this
+           reflects reality. Also subject to action_max_age_s when set;
+           unbounded when it is None.
         3. The robot's current measured joint position from obs_data
            ("fallback_to_observation") — used when the robot has never
            published a command yet in this episode (e.g. an idle arm at the
@@ -1110,14 +1147,30 @@ class BufferedStreamExtractor:
             (position, fill_kind) where position is a copy of the resolved
             array, or None if fill_kind == "dropped".
         """
+        causal = getattr(self.config, "action_match", "nearest") == "causal"
+        max_age = getattr(self.config, "action_max_age_s", None)
+
         if buffer:
-            nearest_idx = self._find_nearest_in_buffer(buffer, target_ts)
-            _, pos, _, _ = buffer[nearest_idx]
-            return pos.copy(), "exact"
+            idx = (
+                self._find_last_at_or_before(buffer, target_ts)
+                if causal
+                else self._find_nearest_in_buffer(buffer, target_ts)
+            )
+            if idx is not None:
+                cmd_ts, pos, _, _ = buffer[idx]
+                if max_age is None or (target_ts - cmd_ts) <= max_age:
+                    return pos.copy(), "exact"
+                # A command is there but too old to speak for this observation.
+                # Tally it and fall through to the tiers below.
+                self._record_action_fill(robot, "stale")
 
         last_known = self._last_known_action.get(robot)
         if last_known is not None:
-            return last_known.copy(), "hold_last"
+            if max_age is None:
+                return last_known.copy(), "hold_last"
+            known_ts = self._last_known_action_ts.get(robot)
+            if known_ts is not None and (target_ts - known_ts) <= max_age:
+                return last_known.copy(), "hold_last"
 
         if robot in obs_data:
             return obs_data[robot]["pos"].copy(), "fallback_to_observation"
@@ -1127,7 +1180,16 @@ class BufferedStreamExtractor:
     def _record_action_fill(self, robot: str, fill_kind: str) -> None:
         """Increment the per-robot, per-episode gap-fill counter."""
         stats = self._action_fill_stats.setdefault(
-            robot, {"exact": 0, "hold_last": 0, "fallback_to_observation": 0, "dropped": 0}
+            robot,
+            {
+                "exact": 0,
+                "hold_last": 0,
+                "fallback_to_observation": 0,
+                "dropped": 0,
+                # Not part of the partition above: counts how often a command
+                # existed but was older than action_max_age_s and so rejected.
+                "stale": 0,
+            },
         )
         stats[fill_kind] += 1
 
@@ -1319,6 +1381,7 @@ class BufferedStreamExtractor:
         eff = np.array([], dtype=np.float32)
 
         self._last_known_action[robot] = pos.copy()
+        self._last_known_action_ts[robot] = timestamp
 
         # Append as tuple: (timestamp, position, velocity, effort)
         joint_buffers[key]["buffer"].append((timestamp, pos, vel, eff))

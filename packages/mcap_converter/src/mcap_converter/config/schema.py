@@ -1,7 +1,7 @@
 """Configuration schema for MCAP to LeRobot conversion"""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -142,6 +142,22 @@ class DataConfig:
     # Number of frames to look ahead when action_from_observation=True.
     # action[t] = observation[t + n]. Default: 10.
     action_from_observation_n: int = 10
+
+    # How a command is matched to an observation timestamp.
+    #   "nearest" (default, historical): closest command in the buffer by
+    #       absolute time difference. This can select a command published
+    #       AFTER the observation, leaking future information into the action.
+    #   "causal": the newest command published at or before the observation.
+    action_match: str = "nearest"
+
+    # Maximum age, in seconds, of the command used for a given observation.
+    # None (default, historical) means unbounded: a command from any time in
+    # the past can be held forward indefinitely. With a value set, a command
+    # older than this is not used and the next fallback tier applies.
+    # Reference rates for openarm quest teleop: commands arrive at 28-45 Hz per
+    # arm (22-35 ms apart) and the dataset is written at 30 fps (33.3 ms), so
+    # ~0.05 covers normal jitter while still catching a disengaged arm.
+    action_max_age_s: Optional[float] = None
 
 
     # Separate feature mappings for observation vs action
