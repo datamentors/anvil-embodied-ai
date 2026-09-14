@@ -112,7 +112,6 @@ def test_causal_falls_through_when_the_buffer_is_all_future():
     """No past command in the buffer, but one was published earlier: hold it."""
     ex = make_extractor(action_match="causal")
     ex._last_known_action["left"] = np.array([5.0, 5.0], dtype=np.float32)
-    ex._last_known_action_ts["left"] = 0.95
     buf = _buffer([(1.10, [9.0, 9.0])])
     pos, kind = ex._resolve_action_position("left", buf, 1.00, {})
     assert kind == "hold_last"
@@ -123,7 +122,7 @@ def test_causal_falls_through_when_the_buffer_is_all_future():
 # maximum age
 
 
-def test_max_age_rejects_a_stale_buffer_command_and_tallies_it():
+def test_stale_buffer_command_without_any_prior_command_falls_to_observation():
     ex = make_extractor(action_match="causal", action_max_age_s=0.05)
     buf = _buffer([(0.80, [1.0, 1.0])])          # 200 ms old
     obs = {"left": {"pos": np.array([7.0, 7.0], dtype=np.float32)}}
@@ -142,21 +141,42 @@ def test_max_age_accepts_a_command_inside_the_window():
     assert ex.get_action_fill_stats().get("left", {}).get("stale", 0) == 0
 
 
-def test_max_age_also_bounds_hold_last():
+def test_hold_last_is_never_bounded_by_max_age():
+    """A parked arm is holding its last command, so that command is the action.
+
+    Substituting the measured pose here would swap a correct value for the
+    commanded pose plus gravity sag — wrong in the same direction on every
+    parked frame. Measured on these recordings: an uncommanded arm moves
+    0.08-0.23 rad against 1.3-1.5 rad while commanded.
+    """
     ex = make_extractor(action_match="causal", action_max_age_s=0.05)
     ex._last_known_action["left"] = np.array([5.0, 5.0], dtype=np.float32)
-    ex._last_known_action_ts["left"] = 0.50     # half a second old
-    obs = {"left": {"pos": np.array([7.0, 7.0], dtype=np.float32)}}
-    pos, kind = ex._resolve_action_position("left", deque(), 1.00, obs)
-    assert kind == "fallback_to_observation"
-    np.testing.assert_array_equal(pos, [7.0, 7.0])
-
-
-def test_hold_last_is_unbounded_when_no_max_age_is_set():
-    ex = make_extractor(action_match="causal")
-    ex._last_known_action["left"] = np.array([5.0, 5.0], dtype=np.float32)
-    ex._last_known_action_ts["left"] = 0.10     # ancient
     obs = {"left": {"pos": np.array([7.0, 7.0], dtype=np.float32)}}
     pos, kind = ex._resolve_action_position("left", deque(), 1.00, obs)
     assert kind == "hold_last"
     np.testing.assert_array_equal(pos, [5.0, 5.0])
+
+
+def test_a_stale_command_comes_back_through_hold_last_not_as_observation():
+    """The realistic shape: a command was buffered, then the arm was released.
+
+    max_age stops it being reported as "exact" and tallies it as stale, but the
+    value returned is that same command — not the measured joint position.
+    """
+    ex = make_extractor(action_match="causal", action_max_age_s=0.05)
+    ex._last_known_action["left"] = np.array([1.0, 1.0], dtype=np.float32)
+    buf = _buffer([(0.80, [1.0, 1.0])])          # 200 ms old
+    obs = {"left": {"pos": np.array([7.0, 7.0], dtype=np.float32)}}
+    pos, kind = ex._resolve_action_position("left", buf, 1.00, obs)
+    assert kind == "hold_last"
+    np.testing.assert_array_equal(pos, [1.0, 1.0])
+    assert ex.get_action_fill_stats()["left"]["stale"] == 1
+
+
+def test_observation_fallback_only_when_the_arm_never_commanded():
+    """The one case with no command to hold: the head of an episode."""
+    ex = make_extractor(action_match="causal", action_max_age_s=0.05)
+    obs = {"left": {"pos": np.array([7.0, 7.0], dtype=np.float32)}}
+    pos, kind = ex._resolve_action_position("left", deque(), 1.00, obs)
+    assert kind == "fallback_to_observation"
+    np.testing.assert_array_equal(pos, [7.0, 7.0])

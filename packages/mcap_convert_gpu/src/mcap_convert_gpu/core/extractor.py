@@ -599,9 +599,6 @@ class BufferedStreamExtractor:
         # _buffer_action_command() and is NOT evicted by the sliding buffer
         # window, so a command published long ago can still be reused.
         self._last_known_action: Dict[str, np.ndarray] = {}
-        # Timestamp of each entry in _last_known_action, so action_max_age_s can
-        # bound how stale a held-forward command is allowed to be.
-        self._last_known_action_ts: Dict[str, float] = {}
 
         # Per-robot, per-episode gap-fill counters, keyed by robot then by
         # one of "exact" | "hold_last" | "fallback_to_observation" | "dropped".
@@ -1134,8 +1131,15 @@ class BufferedStreamExtractor:
            tallied as "stale" and the tiers below apply.
         2. Last command published for this robot ("hold_last") — the arm
            physically holds its last commanded position when idle, so this
-           reflects reality. Also subject to action_max_age_s when set;
-           unbounded when it is None.
+           reflects reality. Never bounded by action_max_age_s; see the comment
+           at the call site for why.
+
+        Note what action_max_age_s does and does not do. A command older than the
+        limit is not returned as "exact", but the very same command is then
+        returned by tier 2 as "hold_last". So the bound does not change the
+        numbers, it changes the label and the tally: it tells you how many frames
+        are being served by a held command rather than a fresh one. Nothing is
+        discarded.
         3. The robot's current measured joint position from obs_data
            ("fallback_to_observation") — used when the robot has never
            published a command yet in this episode (e.g. an idle arm at the
@@ -1164,13 +1168,17 @@ class BufferedStreamExtractor:
                 # Tally it and fall through to the tiers below.
                 self._record_action_fill(robot, "stale")
 
+        # Deliberately NOT bounded by action_max_age_s. An arm that has stopped
+        # being commanded is physically holding its last commanded position, so
+        # that command IS the correct action for these frames. Measured on these
+        # recordings: while an arm is not commanded its joints move 0.08-0.23 rad
+        # against 1.3-1.5 rad while commanded, i.e. it is parked. Rejecting the
+        # held command here would substitute the MEASURED pose, which is the
+        # commanded pose plus gravity sag and compliance error — strictly worse,
+        # and wrong in the same systematic direction for every parked frame.
         last_known = self._last_known_action.get(robot)
         if last_known is not None:
-            if max_age is None:
-                return last_known.copy(), "hold_last"
-            known_ts = self._last_known_action_ts.get(robot)
-            if known_ts is not None and (target_ts - known_ts) <= max_age:
-                return last_known.copy(), "hold_last"
+            return last_known.copy(), "hold_last"
 
         if robot in obs_data:
             return obs_data[robot]["pos"].copy(), "fallback_to_observation"
@@ -1381,7 +1389,6 @@ class BufferedStreamExtractor:
         eff = np.array([], dtype=np.float32)
 
         self._last_known_action[robot] = pos.copy()
-        self._last_known_action_ts[robot] = timestamp
 
         # Append as tuple: (timestamp, position, velocity, effort)
         joint_buffers[key]["buffer"].append((timestamp, pos, vel, eff))
