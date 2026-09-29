@@ -8,6 +8,8 @@ from typing import Any, Protocol
 
 import torch
 
+from ..input_watchdog import ObservationProvenance
+
 
 class InferenceStrategy(Protocol):
     """
@@ -69,6 +71,10 @@ class InferenceStrategy(Protocol):
         Returns:
             Dict mapping joint name -> position value
         """
+        ...
+
+    def get_last_observation_provenance(self) -> ObservationProvenance | None:
+        """Return the exact sensor identities used by the last observation."""
         ...
 
     def get_incomplete_reason(self) -> str:

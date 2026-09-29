@@ -18,6 +18,7 @@ cp .env.example .env
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `MODEL_PATH` | Yes (inference) | Host path to checkpoint dir. Must be absolute or start with `./` — bare relative paths are treated as Docker named volumes. |
+| `IMAGE_TAG` | Yes (deployment) | Runtime image for the deployed code branch. Reuse the same tag for every checkpoint evaluated with that branch; checkpoint identity belongs in `MODEL_PATH`, not in the image tag. |
 | `ROS_DOMAIN_ID` | Yes | ROS2 domain ID — must match the Anvil Devbox. Leave empty for localhost-only. |
 | `CYCLONEDDS_URI` | Yes | Path to CycloneDDS XML config (e.g. `configs/cyclonedds/two_pc_gpu.xml`). |
 | `LEROBOT_EXTRAS` | VLA only | Comma-separated policy extras built into the Docker image — e.g. `smolvla`, `pi,smolvla`. **Rebuild the image after changing:** `docker compose build`. ACT and Diffusion leave this empty. |
@@ -27,8 +28,33 @@ cp .env.example .env
 | `ECHO_TOPIC_ONLY` | No | `true` = skip model loading, subscribe topics and log FPS only. For verifying DDS connectivity without a GPU or checkpoint. Equivalent to `--echo-topic-only`. |
 | `MONITOR_ENABLE` | No | `true` = enable the inference monitor node (records per-step CSV + PNG report). Equivalent to `--monitor-enable`, but without the auto-plot on exit and output dir pre-creation that the flag provides. |
 | `DEBUG` | No | `true` = enable extra metrics: action smoothness, queue depth stats, Action FPS. |
+| `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS` | No | Native CPU thread-pool limits (default: `4`). These prevent the inference process and spawned camera workers from oversubscribing the host and delaying CUDA work. |
 
 For full descriptions and defaults, see [`.env.example`](../.env.example).
+
+### Image and checkpoint lifecycle
+
+Build one image for each code branch or reviewed runtime revision. Do not build
+or tag an image per training run, experiment, or checkpoint. Checkpoints are
+mounted read-only through `MODEL_PATH`, so switching models only recreates the
+container with a different bind mount:
+
+```bash
+# Once, after checking out or changing runtime code/dependencies
+IMAGE_TAG=fix-inference-provenance-saturation docker compose build inference
+
+# For each checkpoint; no image rebuild
+IMAGE_TAG=fix-inference-provenance-saturation \
+MODEL_PATH=/absolute/path/to/checkpoint \
+docker compose up -d inference
+```
+
+Rebuild only after code, the Dockerfile, `LEROBOT_VERSION`, or
+`LEROBOT_EXTRAS` changes. Stop real-hardware inference before building or
+running other GPU-heavy validation on the inference workstation: resource
+contention can trip the temporal watchdog. Record both the image tag or source
+commit and `MODEL_PATH` for every evaluation so the result remains
+reproducible.
 
 ### Script Flags
 
@@ -66,16 +92,19 @@ If `Control Loop` hits 30 Hz, the setup is ready for real hardware.
 ## Production (Real Robot)
 
 ```bash
-# Standard inference
+# Build once after changing the branch runtime
+docker compose build inference
+
+# Standard inference; changing MODEL_PATH does not require --build
 MODEL_PATH=$(pwd)/model_zoo/my-task/checkpoints/last \
-./scripts/run_inference.sh up --build
+./scripts/run_inference.sh up
 
 # With inference monitor
 MODEL_PATH=$(pwd)/model_zoo/my-task/checkpoints/last \
-./scripts/run_inference.sh --monitor-enable up --build
+./scripts/run_inference.sh --monitor-enable up
 
 # Verify DDS connectivity without a checkpoint
-./scripts/run_inference.sh --echo-topic-only up --build
+./scripts/run_inference.sh --echo-topic-only up
 ```
 
 > **`MODEL_PATH` must be absolute or start with `./`.** Bare relative paths are treated as named Docker volumes.
@@ -127,18 +156,201 @@ inference_tuning:
     # Steps consumed per chunk before the next inference fires.
     max_guidance_weight: 10.0
     prefix_attention_schedule: EXP
+    readiness_guided_forwards: 5
+    # Required consecutive guided refills before publication can start.
+    readiness_latency_guard_steps: 2
+    # Extra control periods added to the worst guided latency.
+    readiness_index_phase_tolerance_steps: 1
+    # Allowed control-timer phase difference between wall time and queue index.
+    readiness_scheduler_guard_steps: 1
+    # Additional queue step reserved for dispatch/polling scheduler jitter.
+    readiness_min_guided_overlap_steps: 3
+    # Minimum guided prefix that must survive the bounded refill latency.
+
+diagnostics:
+  rtc_timing: false
+  rtc_cuda_events: false
+  rtc_provenance: false
+  # Enable only in a reviewed shadow profile. The node emits correlated
+  # per-stage wall timings and queries CUDA events asynchronously, without
+  # synchronizing the inference stream or changing readiness calculations.
+  # rtc_provenance additionally records the exact joint/camera counters,
+  # ROS header stamps, receipt ages and a digest/summary of each action chunk.
 ```
 
+**Joint-state process isolation:** the `joint_state_worker` launch
+parameter moves the `/joint_states` subscription into a spawned ROS2 process.
+The complete serialized message and callback-ingress monotonic timestamp cross
+a seqlock-protected shared-memory slot and are parsed normally in the main
+process. The option defaults to `false`. Debug-only command topics may enable
+it directly; a live profile must additionally set
+`runtime.allow_live_joint_state_worker: true` so promotion cannot happen by
+changing only a topic name.
+
 **Safety limits:**
-```yaml
-# safety:
-#   max_position_delta: 0.1
-#   # Hard limit on joint position change per control step (radians).
-#   min_position_delta: 0.05
-#   # Minimum cumulative change before publishing a new command.
-#   # Holds the last command until threshold is crossed — useful for
-#   # overcoming motor dead zones / friction. Default: disabled (null).
+
+Absolute software ranges are currently disabled by default while the deployed
+URDF ranges are reconciled with measured encoder positions. They can be enabled
+without changing the image or checkpoint:
+
+```bash
+ENFORCE_JOINT_POSITION_LIMITS=true docker compose up inference
 ```
+
+When disabled, only configured absolute-range saturation and rejection are
+bypassed. Action shape and finite-value validation, current-joint feedback, the
+fail-closed input and RTC watchdogs, and `max_position_delta` remain active.
+Startup logs emit a prominent warning while absolute ranges are disabled. The
+deployed robot limits should still be corrected and validated before enabling
+unattended operation.
+
+```yaml
+safety:
+  max_position_delta: 0.1
+  # Hard limit on joint position change per control step (radians).
+  min_position_delta: null
+  joint_limit_tolerance: 0.000001
+  saturate_joint_targets: []
+  saturate_joint_margins: {}
+  # Optional bounded acceptance for known recording artefacts. Every named
+  # joint requires an explicit positive margin no larger than 0.05 rad.
+  # Targets inside the margin clamp to the existing hard limit and are counted;
+  # larger violations still fail closed.
+  joint_position_limits:
+    # Required full mapping keyed by exact ROS joint names. See the default
+    # config for all 16 values sourced from the deployed robot URDF.
+    follower_l_finger_joint1: [0.0, 0.05]
+    # ... all remaining configured joints ...
+```
+
+Absolute limits are evaluated after model/controller reordering, before the
+delta limiter can hide an invalid raw target, and once more on the final
+command. The node prepares and validates both arms before publishing either
+one, so a bad target on the right arm cannot leave a left-only command behind.
+Missing, extra, inverted, or non-finite limit entries abort startup.
+Targets outside the configured limit plus the numerical tolerance fail closed
+unless that exact joint has a bounded saturation margin. Saturation never
+expands the hard limit: accepted overshoot is clamped to the existing bound,
+counted in the periodic statistics and limited to 0.05 rad. It is intended only
+for measured recording artefacts and cannot replace correcting the dataset or
+policy. See `inference_envelope_afo.yaml` for a profile whose margins document
+the checkpoint statistics from which they were derived.
+
+`inference_default_afo.yaml` provides the three-camera AFO feature mapping
+(`base`, `left_wrist`, `right_wrist`). `inference_envelope_afo.yaml` extends it
+with the envelope task prompt, measured RTC settings, watchdog limits, bounded
+saturation and opt-in latency/provenance diagnostics. Neither profile contains
+a checkpoint path; pass that separately at launch time.
+
+**Fail-closed input watchdog:**
+```yaml
+watchdog:
+  camera_timeout_sec: 0.25
+  joint_state_timeout_sec: 0.10
+  max_sensor_skew_sec: 0.10
+  max_action_age_sec: 1.50
+  startup_grace_sec: 10.0
+```
+
+Freshness uses local monotonic receive time, not ROS message stamps. Publication
+starts only after all configured cameras and required joints are present, finite,
+fresh, mutually synchronized, and have produced a new sequence. If an input
+stops, an observation repeats, inference fails, or an action is invalid, the node:
+
+1. latches the watchdog;
+2. clears RTC, classic-policy, delta-restore, and limiter state;
+3. suppresses all action publication; and
+4. discards inference results that were already running when the fault occurred.
+
+For RTC policies, input health and policy readiness are separate gates. After
+startup, reset, or rearm, the node performs these phases without publishing:
+
+1. discard one unconditional GPU/model cold forward;
+2. merge one fresh unguided chunk as a provisional seed; and
+3. require five consecutive guided refills to pass all sustainability bounds.
+
+RTC alignment and action freshness use separate clocks. Under the queue lock,
+dispatch captures the queue identity, depth `q0`, consumer index `i0`, leftover,
+and time `t0`. Immediately before merge under the same lock it captures `q1`,
+`i1`, and `t1`. With runtime `L=t1-t0` and index-phase tolerance `P=1`:
+
+```text
+pre-ready:  i1-i0 = 0; D_merge = ceil(f * L)
+post-ready: D_idx = i1-i0 = q0-q1
+            0 <= D_idx <= ceil(f * L)+P
+            q1 >= 1; D_merge = D_idx
+```
+
+Queue identity, index, depth, leftover length, or consumption above the
+wall-clock upper bound is a fail-closed rejection. Consumption may be below the
+wall estimate when the ROS executor delays the publish timer; in that case the
+exact queue index remains authoritative because it is aligned with the leftover
+passed to RTC. Source observation age is not used as a merge delay; it remains
+the independent freshness/provenance clock.
+
+For chunk length `C`, control frequency `f`, queue threshold `T`, exact source
+age at merge `A`, action-age limit `M`, execution horizon `H`, latency guard
+`G=2`, scheduler guard `S=1`, and the last five guided runtimes:
+
+```text
+L_bound   = max(last 5 L) + G/f
+D_bound   = ceil(f * max(last 5 L)) + G
+q_start   = C - D_merge
+wait      = max(0, q_start - T)
+q_trigger = q_start - wait
+q_required = max(0, q_trigger - S)
+
+q_required >= D_bound + 1
+A + (wait + S)/f + L_bound < M
+max(0, min(H, q_required) - D_bound) >= 3
+```
+
+Only the fifth consecutive passing refill reports `[RTC] POLICY_READY`. A miss
+before readiness discards the provisional queue and seed; the next result must
+be unguided and seed a new proof. Before readiness the queue threshold is
+intentionally ignored because publication cannot drain the provisional queue.
+A miss after readiness—including an empty queue, stale result, queue/index
+misalignment, insufficient refill coverage, or insufficient useful
+guidance—latches the watchdog and clears the queue while holding the same safety
+lock used by publication.
+
+These checks deliberately expose timing/configuration incompatibilities. For
+example, `C=50`, `f=30`, `H=12`, and steady `0.55 s` guided forwards yield a
+19-step bounded refill delay but only 12 horizon steps, so useful guided overlap
+is zero and readiness remains closed. Changing `execution_horizon` changes RTC
+policy behavior and requires a reviewed shadow run; do not bypass the gate or
+raise `max_action_age_sec` merely to make it open.
+
+Compressed-camera workers validate the JPEG envelope and capture native decoder
+diagnostics around each decode. A frame with invalid SOI/EOI markers, any native
+decoder warning, an exception, or a missing decoded image is discarded before
+shared memory and does not advance that camera's sequence. Repeated corruption
+therefore reduces the measured input rate and eventually trips the same camera
+freshness watchdog instead of feeding a partially decoded image to the policy.
+
+The watchdog never resumes automatically. Restart the inference node, or first
+restore every input and then explicitly rearm it:
+
+```bash
+ros2 service call /lerobot_inference/rearm_watchdog std_srvs/srv/Trigger '{}'
+```
+
+Rearm is rejected until every required input is healthy and has advanced beyond
+the sequence observed at the fault. The action queue stays empty until a new
+complete observation has been accepted after rearm.
+
+For Pi0.5, startup also fails unless `model.safetensors`, both saved processor
+pipelines, and a valid SHA-256 manifest are present. Create the manifest after
+copying the checkpoint into its isolated deployment directory:
+
+```bash
+python3 scripts/create_checkpoint_manifest.py /absolute/path/to/pretrained_model
+```
+
+The loader accepts `SHA256SUMS.expected` or `checkpoint_manifest.sha256`, hashes
+every entry before allocating the model, and verifies that strict state-dict
+loading actually completed. This guards against LeRobot 0.5.1 returning a
+randomly initialized Pi0.5 model after an internal weight-loading error.
 
 ## DDS Middleware Selection
 

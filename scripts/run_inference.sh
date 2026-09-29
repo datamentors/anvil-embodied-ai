@@ -14,7 +14,8 @@
 #   --debug            Enable debug metrics: action smoothness, queue depth, Action FPS (sets DEBUG=true)
 #   -h, --help         Show this message
 #
-# All other arguments (e.g. up --build, down, logs) are passed directly to docker compose.
+# All other arguments (e.g. up, down, logs) are passed directly to docker compose.
+# Build once per code branch; switch checkpoints with MODEL_PATH without --build.
 #
 # Environment variables:
 #   MONITOR_OUTPUT_DIR   Host dir for monitor CSV/PNG (default: ./monitor_output)
@@ -26,16 +27,16 @@
 #
 # Examples:
 #   # Production inference (real robot), no monitor
-#   MODEL_PATH=/path/to/checkpoint ./scripts/run_inference.sh up --build
+#   MODEL_PATH=/path/to/checkpoint ./scripts/run_inference.sh up
 #
 #   # Production inference with real-time monitor + auto-plot
-#   MODEL_PATH=/path/to/checkpoint ./scripts/run_inference.sh --monitor-enable up --build
+#   MODEL_PATH=/path/to/checkpoint ./scripts/run_inference.sh --monitor-enable up
 #
 #   # Fake-hardware DDS test (FPS monitor only, no GPU)
 #   ./scripts/run_inference.sh --fake-hardware --monitor-enable up --build
 #
 #   # Verify DDS connectivity without a model (no MODEL_PATH needed)
-#   ./scripts/run_inference.sh --echo-topic-only up --build
+#   ./scripts/run_inference.sh --echo-topic-only up
 #
 #   # Fake-hardware full inference pipeline
 #   # NOTE: --profile is a docker compose global flag and must come BEFORE the subcommand.

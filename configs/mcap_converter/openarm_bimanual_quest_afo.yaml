@@ -1,11 +1,11 @@
 # =============================================================================
 # OpenArm MCAP to LeRobot Conversion Configuration
 # =============================================================================
-# Teleop Mode: Quest (VR Controller) — BIMANUAL, ACTION-FROM-OBS FALLBACK
+# Teleop Mode: Quest (VR Controller) — BIMANUAL, ACTION-FROM-OBS LOOKAHEAD
 #
 # Use this variant for bimanual Quest recordings where the explicit action
-# command topics may be missing in some or all episodes. Actions are then
-# derived from follower observations instead of failing conversion.
+# command topics are unavailable or should not be used. Actions are always
+# derived from future follower observations; command topics are ignored.
 #
 # This config also targets the 3-camera layout:
 #   - /cam_wrist_r/image_raw/compressed
@@ -41,8 +41,7 @@ action_topics:
     arm: "right"
     joint_order: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7", "finger_joint1"]
 
-# If action command topics are absent in the MCAP, derive action[t] from
-# observation[t + n] instead of failing conversion.
+# Derive action[t] from observation[t + n] and ignore command topics.
 action_from_observation: true
 action_from_observation_n: 10
 

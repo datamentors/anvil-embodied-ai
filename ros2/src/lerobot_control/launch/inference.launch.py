@@ -34,6 +34,15 @@ def generate_launch_description():
         "control_frequency", default_value="30.0", description="Control loop frequency (Hz)"
     )
 
+    enforce_joint_position_limits_arg = DeclareLaunchArgument(
+        "enforce_joint_position_limits",
+        default_value="false",
+        description=(
+            "Validate and clamp commands against configured absolute joint limits. "
+            "Disable only for an attended evaluation with independent hardware limits."
+        ),
+    )
+
     deterministic_arg = DeclareLaunchArgument(
         "deterministic", default_value="false", description="Enable deterministic mode"
     )
@@ -66,6 +75,12 @@ def generate_launch_description():
         description="Publish /monitor/obs_state, /monitor/raw_output, /monitor/control_cmd for inference_monitor_node",
     )
 
+    joint_state_worker_arg = DeclareLaunchArgument(
+        "joint_state_worker",
+        default_value="false",
+        description="Shadow-only diagnostic: receive /joint_states in a child process",
+    )
+
     # Node
     inference_node = Node(
         package="lerobot_control",
@@ -77,6 +92,9 @@ def generate_launch_description():
                 "model_path": LaunchConfiguration("model_path"),
                 "config_file": LaunchConfiguration("config_file"),
                 "control_frequency": LaunchConfiguration("control_frequency"),
+                "enforce_joint_position_limits": LaunchConfiguration(
+                    "enforce_joint_position_limits"
+                ),
                 "device": LaunchConfiguration("device"),
                 "deterministic": LaunchConfiguration("deterministic"),
                 "deterministic_seed": LaunchConfiguration("deterministic_seed"),
@@ -84,6 +102,7 @@ def generate_launch_description():
                 "debug": LaunchConfiguration("debug"),
                 "debug_image_dir": LaunchConfiguration("debug_image_dir"),
                 "monitor_enable": LaunchConfiguration("monitor_enable"),
+                "joint_state_worker": LaunchConfiguration("joint_state_worker"),
             }
         ],
     )
@@ -94,12 +113,14 @@ def generate_launch_description():
             config_file_arg,
             device_arg,
             control_freq_arg,
+            enforce_joint_position_limits_arg,
             deterministic_arg,
             deterministic_seed_arg,
             echo_topic_only_arg,
             debug_arg,
             debug_image_dir_arg,
             monitor_enable_arg,
+            joint_state_worker_arg,
             inference_node,
         ]
     )

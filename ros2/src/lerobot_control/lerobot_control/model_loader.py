@@ -6,6 +6,8 @@ for pre/post processing instead of custom implementations.
 
 import json
 import random
+from contextlib import suppress
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -33,10 +35,8 @@ def set_deterministic_mode(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
     if hasattr(torch, "use_deterministic_algorithms"):
-        try:
+        with suppress(Exception):
             torch.use_deterministic_algorithms(True, warn_only=True)
-        except Exception:
-            pass
 
 
 def reset_model_state(model):
@@ -78,6 +78,7 @@ class ModelLoader:
         seed: int = 42,
         config_overrides: dict = None,
         rtc_config_yaml: dict = None,
+        require_checkpoint_manifest: bool = True,
     ):
         """
         Initialize model loader.
@@ -95,6 +96,8 @@ class ModelLoader:
             rtc_config_yaml: Dict from the ``rtc:`` YAML section. When set and
                 the model is a VLA (pi0/pi05/smolvla), RTCConfig is injected
                 after loading and ``model.init_rtc_processor()`` is called.
+            require_checkpoint_manifest: Require and verify
+                ``checkpoint_manifest.sha256`` before loading local weights.
         """
         self.model_path = Path(model_path)
         self.device = device
@@ -104,6 +107,7 @@ class ModelLoader:
         self.seed = seed
         self.config_overrides = config_overrides or {}
         self.rtc_config_yaml = rtc_config_yaml or {}
+        self.require_checkpoint_manifest = require_checkpoint_manifest
         self._model = None
         self._pre_processor = None
         self._post_processor = None
@@ -124,6 +128,8 @@ class ModelLoader:
         if self.model_type is None:
             self.model_type = self._detect_model_type()
 
+        self._validate_checkpoint_artifacts()
+
     def _log(self, level: str, msg: str):
         """Log message using ROS2 logger or print."""
         if self.logger:
@@ -141,6 +147,136 @@ class ModelLoader:
         if config_path.exists():
             return json.loads(config_path.read_text()).get("type")
         return None
+
+    def _validate_checkpoint_artifacts(self) -> None:
+        """Fail before model construction if local checkpoint artifacts are unsafe."""
+        if self.model_type not in {"pi0", "pi05", "smolvla"}:
+            return
+
+        required = ["config.json", "model.safetensors"]
+        if self.model_type == "pi05":
+            required.extend(["policy_preprocessor.json", "policy_postprocessor.json"])
+
+        missing = [name for name in required if not (self.model_path / name).is_file()]
+        if missing:
+            raise RuntimeError(
+                "Checkpoint is incomplete; required artifact(s) missing: "
+                + ", ".join(missing)
+            )
+
+        for name in ("config.json", "policy_preprocessor.json", "policy_postprocessor.json"):
+            path = self.model_path / name
+            if not path.exists():
+                continue
+            try:
+                payload = json.loads(path.read_text())
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"Checkpoint JSON is unreadable: {path}: {exc}") from exc
+            if not isinstance(payload, dict) or not payload:
+                raise RuntimeError(f"Checkpoint JSON must contain a non-empty object: {path}")
+
+        config_type = json.loads((self.model_path / "config.json").read_text()).get("type")
+        if config_type != self.model_type:
+            raise RuntimeError(
+                f"Checkpoint type mismatch: requested {self.model_type!r}, "
+                f"config.json contains {config_type!r}"
+            )
+
+        weight_path = self.model_path / "model.safetensors"
+        if weight_path.stat().st_size <= 8:
+            raise RuntimeError(f"Checkpoint weight file is empty or truncated: {weight_path}")
+        try:
+            from safetensors import safe_open
+
+            with safe_open(weight_path, framework="pt", device="cpu") as handle:
+                tensor_names = list(handle.keys())
+        except Exception as exc:
+            raise RuntimeError(f"Checkpoint weights are unreadable: {weight_path}: {exc}") from exc
+        if not tensor_names:
+            raise RuntimeError(f"Checkpoint has no tensors: {weight_path}")
+
+        manifest = next(
+            (
+                candidate
+                for candidate in (
+                    self.model_path / "checkpoint_manifest.sha256",
+                    self.model_path / "SHA256SUMS.expected",
+                )
+                if candidate.is_file()
+            ),
+            None,
+        )
+        if self.require_checkpoint_manifest and manifest is None:
+            raise RuntimeError(
+                f"Checkpoint integrity manifest missing in {self.model_path}; expected "
+                "checkpoint_manifest.sha256 or SHA256SUMS.expected. "
+                "Generate it only after the isolated checkpoint copy is complete."
+            )
+        if manifest is not None:
+            self._verify_checkpoint_manifest(manifest, required)
+
+    def _verify_checkpoint_manifest(self, manifest: Path, required: list[str]) -> None:
+        """Verify a sha256sum-compatible manifest without allowing path escape."""
+        try:
+            lines = manifest.read_text().splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RuntimeError(f"Checkpoint manifest is unreadable: {manifest}: {exc}") from exc
+
+        entries: dict[str, str] = {}
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            parts = line.split(maxsplit=1)
+            if len(parts) != 2:
+                raise RuntimeError(
+                    f"Invalid checkpoint manifest line {line_number}: {line!r}"
+                )
+            digest, relative_name = parts
+            relative_name = relative_name.removeprefix("*")
+            relative = Path(relative_name)
+            if (
+                len(digest) != 64
+                or any(char not in "0123456789abcdefABCDEF" for char in digest)
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or relative_name in {"checkpoint_manifest.sha256", "SHA256SUMS.expected"}
+            ):
+                raise RuntimeError(
+                    f"Unsafe or invalid checkpoint manifest line {line_number}: {line!r}"
+                )
+            normalized_name = relative.as_posix()
+            if normalized_name in entries:
+                raise RuntimeError(
+                    f"Duplicate checkpoint manifest entry: {normalized_name}"
+                )
+            entries[normalized_name] = digest.lower()
+
+        missing_entries = [name for name in required if name not in entries]
+        if missing_entries:
+            raise RuntimeError(
+                "Checkpoint manifest does not cover required artifact(s): "
+                + ", ".join(missing_entries)
+            )
+
+        for relative_name, expected in sorted(entries.items()):
+            path = self.model_path / relative_name
+            if path.is_symlink():
+                raise RuntimeError(
+                    f"Checkpoint manifest artifact must not be a symlink: {relative_name}"
+                )
+            if not path.is_file():
+                raise RuntimeError(f"Checkpoint manifest artifact missing: {relative_name}")
+            digest = sha256()
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                    digest.update(block)
+            actual = digest.hexdigest()
+            if actual != expected:
+                raise RuntimeError(
+                    f"Checkpoint checksum mismatch for {relative_name}: "
+                    f"expected {expected}, got {actual}"
+                )
+        self._log("info", f"Verified checkpoint manifest ({len(entries)} artifacts)")
 
     @property
     def checkpoint_n_action_steps(self) -> int | None:
@@ -192,29 +328,55 @@ class ModelLoader:
 
                 model = DiffusionPolicy.from_pretrained(str(self.model_path))
             elif self.model_type == "smolvla":
-                from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
                 from lerobot.configs.policies import PreTrainedConfig
+                from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
                 vla_cfg = PreTrainedConfig.from_pretrained(str(self.model_path))
                 if hasattr(vla_cfg, "compile_model"):
                     vla_cfg.compile_model = False
                 model = SmolVLAPolicy.from_pretrained(str(self.model_path), config=vla_cfg)
             elif self.model_type == "pi0":
-                from lerobot.policies.pi0.modeling_pi0 import PI0Policy
                 from lerobot.configs.policies import PreTrainedConfig
+                from lerobot.policies.pi0.modeling_pi0 import PI0Policy
 
                 vla_cfg = PreTrainedConfig.from_pretrained(str(self.model_path))
                 if hasattr(vla_cfg, "compile_model"):
                     vla_cfg.compile_model = False
                 model = PI0Policy.from_pretrained(str(self.model_path), config=vla_cfg)
             elif self.model_type == "pi05":
-                from lerobot.policies.pi05 import PI05Policy
                 from lerobot.configs.policies import PreTrainedConfig
+                from lerobot.policies.pi05 import PI05Policy
+
+                class FailClosedPI05Policy(PI05Policy):
+                    """Expose whether LeRobot actually completed state-dict loading."""
+
+                    def load_state_dict(self, state_dict, *args, **kwargs):
+                        result = super().load_state_dict(state_dict, *args, **kwargs)
+                        if result.missing_keys or result.unexpected_keys:
+                            raise RuntimeError(
+                                "Pi0.5 checkpoint did not load exactly: "
+                                f"missing={result.missing_keys}, "
+                                f"unexpected={result.unexpected_keys}"
+                            )
+                        self._anvil_checkpoint_load_completed = True
+                        return result
 
                 vla_cfg = PreTrainedConfig.from_pretrained(str(self.model_path))
                 if hasattr(vla_cfg, "compile_model"):
                     vla_cfg.compile_model = False
-                model = PI05Policy.from_pretrained(str(self.model_path), config=vla_cfg)
+                model = FailClosedPI05Policy.from_pretrained(
+                    str(self.model_path),
+                    config=vla_cfg,
+                    local_files_only=True,
+                    strict=True,
+                )
+                # LeRobot 0.5.1 PI05Policy catches its own load exceptions and
+                # returns a randomly initialized model. Never trust mere return.
+                if not getattr(model, "_anvil_checkpoint_load_completed", False):
+                    raise RuntimeError(
+                        "Pi0.5 from_pretrained returned without completing strict "
+                        "checkpoint weight loading; refusing random/partial weights"
+                    )
             else:
                 raise ValueError(f"Unsupported model type: {self.model_type}")
 
@@ -289,8 +451,8 @@ class ModelLoader:
             return
 
         try:
-            from lerobot.policies.rtc.configuration_rtc import RTCConfig
             from lerobot.configs.types import RTCAttentionSchedule
+            from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
             schedule_str = self.rtc_config_yaml.get("prefix_attention_schedule", "EXP")
             schedule = RTCAttentionSchedule[schedule_str]
@@ -365,10 +527,8 @@ class ModelLoader:
                 )
                 # Move to device if the pipeline supports it
                 if hasattr(pre_processor, "to") and callable(pre_processor.to):
-                    try:
+                    with suppress(TypeError, AttributeError):
                         pre_processor.to(self.device)
-                    except (TypeError, AttributeError):
-                        pass  # Pipeline doesn't support device movement
                 self._pre_processor = pre_processor
                 self._log("info", "Loaded preprocessor pipeline from checkpoint")
 
@@ -378,34 +538,37 @@ class ModelLoader:
                 )
                 # Move to device if the pipeline supports it
                 if hasattr(post_processor, "to") and callable(post_processor.to):
-                    try:
+                    with suppress(TypeError, AttributeError):
                         post_processor.to(self.device)
-                    except (TypeError, AttributeError):
-                        pass  # Pipeline doesn't support device movement
                 self._post_processor = post_processor
                 self._log("info", "Loaded postprocessor pipeline from checkpoint")
 
         except FileNotFoundError as e:
+            if self.model_type == "pi05":
+                raise RuntimeError(
+                    "Pi0.5 processor pipeline artifact is missing; refusing "
+                    "unnormalized inference"
+                ) from e
             self._log("warn", f"Processor pipelines not found: {e}")
         except Exception as e:
+            if self.model_type == "pi05":
+                raise RuntimeError(
+                    "Pi0.5 processor pipeline failed to load; refusing inference"
+                ) from e
             self._log("error", f"Failed to load processor pipelines: {e}")
 
-        # For pi05: if no preprocessor found in the checkpoint (fine-tuned models often
-        # skip saving policy_preprocessor.json), rebuild it from the policy's own factory.
-        # dataset_stats=None → normalization uses empty stats (passthrough), but tokenization
-        # is correctly configured with the PaliGemma tokenizer.
-        if self.model_type == "pi05" and pre_processor is None:
-            try:
-                from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
-
-                pre_processor, fallback_post = make_pi05_pre_post_processors(
-                    model.config, dataset_stats=None
-                )
-                if post_processor is None:
-                    post_processor = fallback_post
-                self._log("info", "Built pi05 processor from policy factory (no policy_preprocessor.json found)")
-            except Exception as e:
-                self._log("warn", f"Could not build pi05 processor from factory: {e}")
+        if self.model_type == "pi05" and (
+            pre_processor is None or post_processor is None
+        ):
+            missing = []
+            if pre_processor is None:
+                missing.append("preprocessor")
+            if post_processor is None:
+                missing.append("postprocessor")
+            raise RuntimeError(
+                "Pi0.5 requires checkpoint normalization processors; failed to load: "
+                + ", ".join(missing)
+            )
 
         if pre_processor is None and post_processor is None:
             self._log(

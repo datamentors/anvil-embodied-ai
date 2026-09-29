@@ -168,11 +168,20 @@ class ActionLimiter:
         Returns:
             Processed action ready for publishing (in controller order, delta-limited)
         """
-        # Make a copy to avoid modifying original
-        action = action.copy()
+        del joint_order, ref_state  # Backward-compatible, intentionally unused.
+        # Reorder from model order to controller order, then use the same
+        # controller-order path exposed to callers that must validate or
+        # otherwise inspect absolute targets before delta limiting.
+        action = self.reorder(action.copy())
+        return self.process_controller_order(action, current_positions)
 
-        # Reorder from model order to controller order
-        action = self.reorder(action)
+    def process_controller_order(
+        self,
+        action: np.ndarray,
+        current_positions: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Apply delta/deadband limiting to a controller-order absolute target."""
+        action = action.copy()
 
         # Apply delta limiting (always against current position for safety)
         if current_positions is not None:

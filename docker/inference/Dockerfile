@@ -13,7 +13,9 @@ RUN apt-get update && apt-get install -y \
     python3-venv \
     git \
     curl \
+    libatomic1 \
     ros-jazzy-rmw-cyclonedds-cpp \
+    ros-jazzy-std-srvs \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for Python package management
@@ -41,6 +43,7 @@ RUN if [ -n "${LEROBOT_EXTRAS}" ]; then \
 RUN find /usr/local/lib -path "*/lerobot/policies/__init__.py" -exec sed -i '/groot/d' {} \;
 
 # Copy ROS2 package (changes often → late layer)
+COPY ros2/src/anvil_msgs /workspace/src/anvil_msgs
 COPY ros2/src/lerobot_control /workspace/src/lerobot_control
 
 # Copy configs (lerobot_control + cyclonedds)

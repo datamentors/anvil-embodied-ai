@@ -22,13 +22,14 @@ from typing import List
 
 import av
 import huggingface_hub
+import yaml
+from anvil_shared.provenance import git_provenance
 from rich.console import Console, Group
 from rich.markup import escape
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
-    MofNCompleteColumn,
     Progress,
     SpinnerColumn,
     TextColumn,
@@ -36,7 +37,6 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from anvil_shared.provenance import git_provenance
 from mcap_converter import (
     ConfigLoader,
     DataConfig,
@@ -425,6 +425,18 @@ def _ensure_output_readable(output_dir: str) -> None:
             continue
 
 
+def _write_effective_conversion_config(config: DataConfig, destination: str | Path) -> None:
+    """Persist the configuration actually used, including CLI overrides."""
+    config_to_save = asdict(config)
+    config_to_save["joint_names"] = config_to_save.pop("joint_name_pattern")
+    if not config_to_save["robot_state_topics"]:
+        config_to_save.pop("robot_state_topics")
+    if not config_to_save["motor_feature_mapping"]:
+        config_to_save.pop("motor_feature_mapping")
+    with open(destination, "w") as config_file:
+        yaml.safe_dump(config_to_save, config_file, sort_keys=False)
+
+
 def _copy_conversion_config_from_shard(shard_output_dir: Path, output_dir: Path) -> None:
     """Keep the final merged dataset's conversion config alongside the data."""
     src = shard_output_dir / "conversion_config.yaml"
@@ -806,38 +818,14 @@ def convert_session(
     conversion_config_dest = os.path.join(output_dir, "conversion_config.yaml")
     if resume_from > 0:
         log(f"Skipping config copy — using existing [dim]{conversion_config_dest}[/dim]")
-    elif config_path and os.path.exists(config_path):
-        shutil.copy(config_path, conversion_config_dest)
-        log(f"Copied conversion config: [dim]{conversion_config_dest}[/dim]")
     else:
-        # Save config from DataConfig object
-        import yaml
-
-        config_to_save = {
-            "robot_state_topic": config.robot_state_topic,
-            "joint_names": {
-                "separator": config.joint_name_pattern.separator,
-                "source": config.joint_name_pattern.source,
-                "arms": config.joint_name_pattern.arms,
-            },
-            "camera_topic_mapping": config.camera_topic_mapping,
-        }
-        if config.action_topics:
-            config_to_save["action_topics"] = config.action_topics
-
-        with open(conversion_config_dest, "w") as f:
-            yaml.dump(
-                config_to_save,
-                f,
-                default_flow_style=False,
-            )
-        log(f"Saved conversion config: [dim]{conversion_config_dest}[/dim]")
+        _write_effective_conversion_config(config, conversion_config_dest)
+        log(f"Saved effective conversion config: [dim]{conversion_config_dest}[/dim]")
 
     # Append git provenance to conversion_config.yaml (skip when resuming — already present)
     if resume_from == 0:
         provenance = git_provenance()
         if provenance:
-            import yaml
             with open(conversion_config_dest, "a") as _f:
                 _f.write("\n# --- provenance ---\n")
                 yaml.dump(provenance, _f, default_flow_style=False)

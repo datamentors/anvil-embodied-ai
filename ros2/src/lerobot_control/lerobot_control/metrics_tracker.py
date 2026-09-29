@@ -53,8 +53,18 @@ class MetricsTracker:
 
     def record_joint_state(self):
         """Record a joint state reception event."""
+        self.record_joint_states(1)
+
+    def record_joint_states(self, count: int):
+        """Record ``count`` joint states in O(1), including skipped slot values."""
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise TypeError("joint state count must be an integer")
+        if count < 0:
+            raise ValueError("joint state count must be >= 0")
+        if count == 0:
+            return
         self._ensure_started()
-        self._joint_count += 1
+        self._joint_count += count
 
     def record_control_loop(self):
         """Record a control loop execution."""

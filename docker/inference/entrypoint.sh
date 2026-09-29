@@ -29,12 +29,13 @@ if [ -n "${CYCLONEDDS_URI}" ]; then
     echo "[entrypoint] CYCLONEDDS_URI=${CYCLONEDDS_URI}"
 fi
 
-# When DEBUG=true, auto-configure debug image capture
+# Debug metrics and image capture are deliberately independent. Saving PNGs in
+# camera callbacks adds disk/CPU work that must not contaminate latency tests.
 DEBUG_IMAGE_ARG=""
-if [ "${DEBUG:-false}" = "true" ]; then
+if [ "${CAPTURE_DEBUG_IMAGES:-false}" = "true" ]; then
     mkdir -p /workspace/debug_images
     DEBUG_IMAGE_ARG="debug_image_dir:=/workspace/debug_images"
-    echo "[entrypoint] DEBUG=true — saving pre-model images to /workspace/debug_images"
+    echo "[entrypoint] CAPTURE_DEBUG_IMAGES=true — saving pre-model images to /workspace/debug_images"
 fi
 
 exec "$@" ${DEBUG_IMAGE_ARG}
