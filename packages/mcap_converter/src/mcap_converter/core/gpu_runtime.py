@@ -270,6 +270,34 @@ def _fast_camera_encoder_thread_run(self) -> None:
         self.result_queue.put(("error", str(exc)))
 
 
+_ORIGINAL_GET_CODEC_OPTIONS = None
+
+
+def _codec_options_with_quality_override(vcodec, g, crf, preset):
+    """Honour ANVIL_VIDEO_CRF over LeRobot's hard-coded crf=30 default.
+
+    LeRobotDataset.create() does not expose crf, so the only way to control
+    encode quality is here, where both the batch and the streaming encoder
+    converge.
+
+    Why this is needed: LeRobot maps the same number onto different knobs per
+    encoder -- "crf" for libx264/libsvtav1, but "qp" for the NVENC encoders.
+    A rate factor of 30 and a constant quantiser of 30 are not the same
+    quality. Measured on these recordings at 640x480/30fps: libx264 crf=30
+    gives ~2000 kbps, hevc_nvenc qp=30 gives ~360 kbps. Matching the reference
+    dataset on the GPU path therefore needs an explicit, lower qp.
+    """
+    import os
+
+    override = os.environ.get("ANVIL_VIDEO_CRF", "").strip()
+    if override:
+        try:
+            crf = int(override)
+        except ValueError as exc:
+            raise ValueError("ANVIL_VIDEO_CRF must be an integer") from exc
+    return _ORIGINAL_GET_CODEC_OPTIONS(vcodec, g, crf, preset)
+
+
 def apply_gpu_runtime_patches() -> None:
     """Patch LeRobot's hot runtime paths once per process."""
     global _PATCH_APPLIED, _ORIGINAL_COMPUTE_EPISODE_STATS
@@ -282,6 +310,11 @@ def apply_gpu_runtime_patches() -> None:
 
     if _ORIGINAL_COMPUTE_EPISODE_STATS is None:
         _ORIGINAL_COMPUTE_EPISODE_STATS = dataset_writer_mod.compute_episode_stats
+
+    global _ORIGINAL_GET_CODEC_OPTIONS
+    if _ORIGINAL_GET_CODEC_OPTIONS is None:
+        _ORIGINAL_GET_CODEC_OPTIONS = video_utils_mod._get_codec_options
+    video_utils_mod._get_codec_options = _codec_options_with_quality_override
 
     dataset_writer_mod.compute_episode_stats = compute_fast_episode_stats
     compute_stats_mod.compute_episode_stats = compute_fast_episode_stats
