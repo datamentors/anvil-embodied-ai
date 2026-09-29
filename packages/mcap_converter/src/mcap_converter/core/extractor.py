@@ -1058,6 +1058,34 @@ class BufferedStreamExtractor:
 
             return result
 
+    def _find_last_at_or_before(
+        self,
+        buffer: deque,
+        target_ts: float,
+    ) -> Optional[int]:
+        """
+        Index of the newest entry published at or before target_ts.
+
+        Unlike _find_nearest_in_buffer this never looks forward. A command
+        published after an observation cannot have influenced that observation,
+        so using it would leak future information into the action.
+
+        Args:
+            buffer: Deque of (timestamp, ...) tuples, monotonic in timestamp
+            target_ts: Observation timestamp
+
+        Returns:
+            Index of the newest entry at or before target_ts, or None when every
+            entry in the buffer is newer than it.
+        """
+        idx = None
+        for i, item in enumerate(buffer):
+            if item[0] <= target_ts:
+                idx = i
+            else:
+                break
+        return idx
+
     def _finalize_afo_frame(
         self,
         pending_frames: deque,
@@ -1135,10 +1163,23 @@ class BufferedStreamExtractor:
         when the arm is disengaged (no live command in the sliding buffer).
 
         Fallback order:
-        1. Nearest command in the live buffer ("exact").
-        2. Last command ever published for this robot, regardless of how long
-           ago ("hold_last") — the arm physically holds its last commanded
-           position when idle, so this reflects reality.
+        1. A command from the live buffer ("exact"). Which one depends on
+           config.action_match: "nearest" picks the closest in absolute time
+           (and may therefore sit AFTER the observation); "causal" picks the
+           newest one at or before it. Either way, when config.action_max_age_s
+           is set the command must be no older than that, otherwise it is
+           tallied as "stale" and the tiers below apply.
+        2. Last command published for this robot ("hold_last") — the arm
+           physically holds its last commanded position when idle, so this
+           reflects reality. Never bounded by action_max_age_s; see the comment
+           at the call site for why.
+
+        Note what action_max_age_s does and does not do. A command older than the
+        limit is not returned as "exact", but the very same command is then
+        returned by tier 2 as "hold_last". So the bound does not change the
+        numbers, it changes the label and the tally: it tells you how many frames
+        are being served by a held command rather than a fresh one. Nothing is
+        discarded.
         3. The robot's current measured joint position from obs_data
            ("fallback_to_observation") — used when the robot has never
            published a command yet in this episode (e.g. an idle arm at the
@@ -1150,11 +1191,31 @@ class BufferedStreamExtractor:
             (position, fill_kind) where position is a copy of the resolved
             array, or None if fill_kind == "dropped".
         """
-        if buffer:
-            nearest_idx = self._find_nearest_in_buffer(buffer, target_ts)
-            _, pos, _, _ = buffer[nearest_idx]
-            return pos.copy(), "exact"
+        causal = getattr(self.config, "action_match", "nearest") == "causal"
+        max_age = getattr(self.config, "action_max_age_s", None)
 
+        if buffer:
+            idx = (
+                self._find_last_at_or_before(buffer, target_ts)
+                if causal
+                else self._find_nearest_in_buffer(buffer, target_ts)
+            )
+            if idx is not None:
+                cmd_ts, pos, _, _ = buffer[idx]
+                if max_age is None or (target_ts - cmd_ts) <= max_age:
+                    return pos.copy(), "exact"
+                # A command is there but too old to speak for this observation.
+                # Tally it and fall through to the tiers below.
+                self._record_action_fill(robot, "stale")
+
+        # Deliberately NOT bounded by action_max_age_s. An arm that has stopped
+        # being commanded is physically holding its last commanded position, so
+        # that command IS the correct action for these frames. Measured on these
+        # recordings: while an arm is not commanded its joints move 0.08-0.23 rad
+        # against 1.3-1.5 rad while commanded, i.e. it is parked. Rejecting the
+        # held command here would substitute the MEASURED pose, which is the
+        # commanded pose plus gravity sag and compliance error — strictly worse,
+        # and wrong in the same systematic direction for every parked frame.
         last_known = self._last_known_action.get(robot)
         if last_known is not None:
             return last_known.copy(), "hold_last"
@@ -1167,7 +1228,16 @@ class BufferedStreamExtractor:
     def _record_action_fill(self, robot: str, fill_kind: str) -> None:
         """Increment the per-robot, per-episode gap-fill counter."""
         stats = self._action_fill_stats.setdefault(
-            robot, {"exact": 0, "hold_last": 0, "fallback_to_observation": 0, "dropped": 0}
+            robot,
+            {
+                "exact": 0,
+                "hold_last": 0,
+                "fallback_to_observation": 0,
+                "dropped": 0,
+                # Not part of the partition above: counts how often a command
+                # existed but was older than action_max_age_s and so rejected.
+                "stale": 0,
+            },
         )
         stats[fill_kind] += 1
 

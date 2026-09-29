@@ -1164,10 +1164,23 @@ def build_parser(profile: str = "standard") -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--vcodec", type=str, default=defaults["default_vcodec"],
-        choices=["h264", "hevc", "libsvtav1", "auto"],
+        choices=["h264", "hevc", "libsvtav1", "auto",
+                 "h264_nvenc", "hevc_nvenc", "h264_vaapi", "h264_qsv"],
         help=(
             f"video codec (default: {defaults['default_vcodec']}). "
-            "Use 'auto' to let LeRobot pick the best available hardware encoder"
+            "Use 'auto' to let LeRobot pick the best available hardware encoder, "
+            "or name a hardware encoder directly to keep the codec family fixed "
+            "(e.g. h264_nvenc to encode on the GPU while staying h264)"
+        ),
+    )
+    parser.add_argument(
+        "--video-crf", type=int, default=None,
+        help=(
+            "encode quality. LeRobot's default is 30, but the same number means "
+            "different things per encoder: a rate factor for h264/hevc/libsvtav1, "
+            "a constant quantiser for the NVENC/VAAPI encoders. Measured here at "
+            "640x480/30fps: libx264 crf=30 gives ~2000 kbps, hevc_nvenc qp=30 "
+            "gives ~360 kbps. Set this explicitly when matching another dataset."
         ),
     )
     parser.add_argument(
@@ -1239,6 +1252,9 @@ def main_with_profile(args=None, profile: str = "standard"):
     defaults = _PROFILE_DEFAULTS[profile]
     parser = build_parser(profile=profile)
     args = parser.parse_args(args)
+    if getattr(args, "video_crf", None) is not None:
+        # lido por _codec_options_with_quality_override em core/gpu_runtime.py
+        os.environ["ANVIL_VIDEO_CRF"] = str(args.video_crf)
     requested_parallel_workers = (
         defaults["parallel_episode_workers"]
         if args.parallel_episodes is None
