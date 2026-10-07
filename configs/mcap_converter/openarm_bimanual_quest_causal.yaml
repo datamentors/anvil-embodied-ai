@@ -1,13 +1,12 @@
 # =============================================================================
-# OpenArm MCAP to LeRobot Conversion Configuration — 16:9 variant (480×270)
+# OpenArm MCAP to LeRobot Conversion — Quest teleop, causal command actions
 # =============================================================================
-# Teleop Mode: Quest (VR Controller)
+# Recorded commands are selected at or before each reference camera timestamp.
+# action_max_age_s labels targets older than 50 ms as held commands; their
+# values remain valid for an idle arm until a newer causal command arrives.
+# No future-observation lookahead is enabled.
 #
-# Use this config when the source cameras are 1920×1080 (16:9).
-# image_resolution [480, 270] is an exact ÷4 downscale → no black bars.
-# The 4:3 default (openarm_bimanual_quest.yaml) produces ~25% letterbox
-# padding at the top/bottom, wasting activation memory and degrading
-# visual features.
+# Teleop Mode: Quest (VR Controller)
 #
 # In this mode, actions are sent as position commands via separate ROS2
 # command topics (std_msgs/Float64MultiArray) — one per arm. The
@@ -57,9 +56,11 @@ joint_names:
 # The joint ordering in the Float64MultiArray.data array must match
 # the observation joint ordering for the corresponding arm.
 
-# Use recorded commands; future-observation actions require explicit opt-in.
+# How a command is matched to an observation timestamp, and how stale it may be.
+# See the header for why these values.
 action_from_observation: false
 action_match: causal
+action_max_age_s: 0.05
 
 action_topics:
   "/follower_l_forward_position_controller/commands":
@@ -76,7 +77,6 @@ action_topics:
 
 # ROS2 image topics (sensor_msgs/Image or sensor_msgs/CompressedImage)
 camera_topics:
-  - "/cam_waist/image_raw/compressed"
   - "/cam_wrist_r/image_raw/compressed"
   - "/cam_chest/image_raw/compressed"
   - "/cam_wrist_l/image_raw/compressed"
@@ -84,13 +84,12 @@ camera_topics:
 # Map ROS topics to dataset camera names
 # These become: observation.images.{name}
 camera_topic_mapping:
-  "/cam_waist/image_raw/compressed": "waist"
-  "/cam_wrist_r/image_raw/compressed": "wrist_r"
-  "/cam_chest/image_raw/compressed": "chest"
-  "/cam_wrist_l/image_raw/compressed": "wrist_l"
+  "/cam_wrist_r/image_raw/compressed": "right_wrist"
+  "/cam_chest/image_raw/compressed": "base"
+  "/cam_wrist_l/image_raw/compressed": "left_wrist"
 
 # Target image resolution [width, height]
-image_resolution: [480, 270]  # 16:9, exact ÷4 of 1920×1080 — no letterbox padding
+image_resolution: [640, 480]
 
 
 # =============================================================================
@@ -100,9 +99,9 @@ image_resolution: [480, 270]  # 16:9, exact ÷4 of 1920×1080 — no letterbox p
 # What to extract from observation joints (follower)
 observation_feature_mapping:
   state: "position"      # Primary feature -> observation.state
-  others:                # Additional features
-    - "velocity"         # -> observation.velocity
-    - "effort"           # -> observation.effort
+  others: []             # Additional features (uncomment below to enable)
+    # - "velocity"        # -> observation.velocity
+    # - "effort"          # -> observation.effort
 
 # What to extract from action commands
 # Note: Float64MultiArray only contains position commands,
@@ -138,4 +137,3 @@ action_feature_mapping:
 #   observation.images.chest    = camera2 frames
 #   observation.images.wrist_r  = camera1 frames
 #   observation.images.wrist_l  = camera3 frames
-

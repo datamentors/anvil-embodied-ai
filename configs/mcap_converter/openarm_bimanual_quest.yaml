@@ -51,6 +51,10 @@ joint_names:
 # The joint ordering in the Float64MultiArray.data array must match
 # the observation joint ordering for the corresponding arm.
 
+# Use recorded commands; future-observation actions require explicit opt-in.
+action_from_observation: false
+action_match: causal
+
 action_topics:
   "/follower_l_forward_position_controller/commands":
     arm: "left"

@@ -1,7 +1,7 @@
 """Configuration schema for MCAP to LeRobot conversion"""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -143,6 +143,18 @@ class DataConfig:
     # action_from_observation=True. action[t] = observation[t + n]. The final
     # n observations are omitted because they have no future target. Default: 10.
     action_from_observation_n: int = 10
+
+    # How a command is matched to an observation timestamp.
+    #   "nearest" (explicit compatibility mode): closest command in the buffer by
+    #       absolute time difference. This can select a command published
+    #       AFTER the observation, leaking future information into the action.
+    #   "causal" (default): the newest command published at or before the observation.
+    action_match: str = "causal"
+
+    # Maximum age of a fresh command. Older causal targets are still held
+    # for idle arms and counted separately; this does not expire a held target.
+    # None leaves the fresh-command age unbounded.
+    action_max_age_s: Optional[float] = None
 
 
     # Separate feature mappings for observation vs action

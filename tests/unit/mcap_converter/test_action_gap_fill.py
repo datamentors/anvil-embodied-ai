@@ -27,6 +27,7 @@ from mcap_converter.core.extractor import BufferedStreamExtractor
 def make_config() -> DataConfig:
     """Bimanual quest-teleop-style config matching the real bug scenario."""
     return DataConfig(
+        action_match="nearest",
         action_topics={
             "/follower_l_forward_position_controller/commands": ActionTopicConfig(
                 arm="left", joint_order=["joint1", "joint2"]
@@ -174,8 +175,16 @@ class TestRecordActionFill:
         extractor._record_action_fill("left", "exact")
 
         stats = extractor.get_action_fill_stats()
-        assert stats["right"] == {"exact": 1, "hold_last": 2, "fallback_to_observation": 0, "dropped": 0}
-        assert stats["left"] == {"exact": 1, "hold_last": 0, "fallback_to_observation": 0, "dropped": 0}
+        # "stale" is not one of the fallback tiers: it counts how often a
+        # command existed but was older than action_max_age_s. Unset here.
+        assert stats["right"] == {
+            "exact": 1, "hold_last": 2, "fallback_to_observation": 0,
+            "dropped": 0, "stale": 0,
+        }
+        assert stats["left"] == {
+            "exact": 1, "hold_last": 0, "fallback_to_observation": 0,
+            "dropped": 0, "stale": 0,
+        }
 
 
 # =============================================================================
