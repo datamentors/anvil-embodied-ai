@@ -175,16 +175,8 @@ class TestRecordActionFill:
         extractor._record_action_fill("left", "exact")
 
         stats = extractor.get_action_fill_stats()
-        # "stale" is not one of the fallback tiers: it counts how often a
-        # command existed but was older than action_max_age_s. Unset here.
-        assert stats["right"] == {
-            "exact": 1, "hold_last": 2, "fallback_to_observation": 0,
-            "dropped": 0, "stale": 0,
-        }
-        assert stats["left"] == {
-            "exact": 1, "hold_last": 0, "fallback_to_observation": 0,
-            "dropped": 0, "stale": 0,
-        }
+        assert stats["right"] == {"exact": 1, "hold_last": 2, "fallback_to_observation": 0, "dropped": 0}
+        assert stats["left"] == {"exact": 1, "hold_last": 0, "fallback_to_observation": 0, "dropped": 0}
 
 
 # =============================================================================

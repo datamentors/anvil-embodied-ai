@@ -109,8 +109,7 @@ commands (`action_from_observation: false`). `action_match: causal` selects the
 newest command at or before the reference camera timestamp, keeping each arm
 and its gripper together. An idle arm retains its last causal command; before
 its first eligible command, its measured position is used. Reading ahead never
-makes a future command eligible. `action_max_age_s`, when set, distinguishes
-fresh commands from held targets; it does not expire the held target. Explicit
+makes a future command eligible. Explicit
 `action_match: nearest` retains the older nearest-neighbour behaviour and can
 select future commands. The `_afo.yaml` configs remain an explicit opt-in.
 

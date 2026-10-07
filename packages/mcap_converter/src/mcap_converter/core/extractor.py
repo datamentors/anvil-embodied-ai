@@ -1098,21 +1098,7 @@ class BufferedStreamExtractor:
         buffer: deque,
         target_ts: float,
     ) -> Optional[int]:
-        """
-        Index of the newest entry published at or before target_ts.
-
-        Unlike _find_nearest_in_buffer this never looks forward. A command
-        published after an observation cannot have influenced that observation,
-        so using it would leak future information into the action.
-
-        Args:
-            buffer: Deque of (timestamp, ...) tuples, monotonic in timestamp
-            target_ts: Observation timestamp
-
-        Returns:
-            Index of the newest entry at or before target_ts, or None when every
-            entry in the buffer is newer than it.
-        """
+        """Find the newest buffered command at or before the frame timestamp."""
         idx = None
         for i, item in enumerate(buffer):
             if item[0] <= target_ts:
@@ -1166,37 +1152,10 @@ class BufferedStreamExtractor:
         Resolve the action position for one robot at target_ts, forward-filling
         when the arm is disengaged (no live command in the sliding buffer).
 
-        Fallback order:
-        1. A command from the live buffer ("exact"). Which one depends on
-           config.action_match: "nearest" picks the closest in absolute time
-           (and may therefore sit AFTER the observation); "causal" picks the
-           newest one at or before it. Either way, when config.action_max_age_s
-           is set the command must be no older than that, otherwise it is
-           tallied as "stale" and the tiers below apply.
-        2. Last eligible command for this robot ("hold_last") — the arm
-           physically holds its last commanded position when idle, so this
-           reflects reality. Never bounded by action_max_age_s; see the comment
-           at the call site for why.
-
-        Note what action_max_age_s does and does not do. A command older than the
-        limit is not returned as "exact", but the very same command is then
-        returned by tier 2 as "hold_last". So the bound does not change the
-        numbers, it changes the label and the tally: it tells you how many frames
-        are being served by a held command rather than a fresh one. Nothing is
-        discarded.
-        3. The robot's current measured joint position from obs_data
-           ("fallback_to_observation") — used when the robot has never
-           published a command yet in this episode (e.g. an idle arm at the
-           very start of a recording).
-        4. None ("dropped") — should not happen in practice since
-           observation data is dense, but kept as a safety net.
-
-        Returns:
-            (position, fill_kind) where position is a copy of the resolved
-            array, or None if fill_kind == "dropped".
+        Commands are selected as complete arm/gripper vectors. Causal mode
+        holds only past commands; before the first command it uses measured state.
         """
         causal = getattr(self.config, "action_match", "causal") == "causal"
-        max_age = getattr(self.config, "action_max_age_s", None)
 
         if buffer:
             idx = (
@@ -1208,11 +1167,7 @@ class BufferedStreamExtractor:
                 cmd_ts, pos, _, _ = buffer[idx]
                 if causal:
                     self._remember_causal_action(robot, cmd_ts, pos)
-                if max_age is None or (target_ts - cmd_ts) <= max_age:
-                    return pos.copy(), "exact"
-                # A command is there but too old to speak for this observation.
-                # Tally it and fall through to the tiers below.
-                self._record_action_fill(robot, "stale")
+                return pos.copy(), "exact"
 
         # A parked arm keeps its last target, even beyond the fresh-command
         # age threshold. In causal mode that target must be from the past;
@@ -1239,16 +1194,7 @@ class BufferedStreamExtractor:
     def _record_action_fill(self, robot: str, fill_kind: str) -> None:
         """Increment the per-robot, per-episode gap-fill counter."""
         stats = self._action_fill_stats.setdefault(
-            robot,
-            {
-                "exact": 0,
-                "hold_last": 0,
-                "fallback_to_observation": 0,
-                "dropped": 0,
-                # Not part of the partition above: counts how often a command
-                # existed but was older than action_max_age_s and so rejected.
-                "stale": 0,
-            },
+            robot, {"exact": 0, "hold_last": 0, "fallback_to_observation": 0, "dropped": 0}
         )
         stats[fill_kind] += 1
 

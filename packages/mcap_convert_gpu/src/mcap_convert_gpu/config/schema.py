@@ -151,12 +151,6 @@ class DataConfig:
     #   "causal" (default): the newest command published at or before the observation.
     action_match: str = "causal"
 
-    # Maximum age of a fresh command. Older causal targets are still held
-    # for idle arms and counted separately; this does not expire a held target.
-    # None leaves the fresh-command age unbounded.
-    action_max_age_s: Optional[float] = None
-
-
     # Separate feature mappings for observation vs action
     # This allows different features for input (observation) and output (action)
     observation_feature_mapping: FeatureMapping = field(
