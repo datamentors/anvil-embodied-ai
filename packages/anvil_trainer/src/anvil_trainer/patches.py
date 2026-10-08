@@ -31,6 +31,7 @@ from typing import Any
 
 from anvil_shared.provenance import git_provenance
 from anvil_shared.splits import compute_split_episodes, load_split_info, save_split_info
+from anvil_shared.stratified import validate_split_info
 
 from anvil_trainer.config import TrainingConfig
 from anvil_trainer.transforms import (
@@ -74,6 +75,9 @@ class TransformRunner:
         self._val_dataloader = None   # set by apply_val_loss_patch when make_dataset is called
         self._test_dataloader = None  # set by apply_val_loss_patch when make_dataset is called
         self._split_info: dict = {}   # populated by patched_make_dataset
+        self._split_source: str | None = None    # set when --split-file is used
+        self._split_strategy: str = "random"     # "random" or the file's own strategy
+        self._split_strata: dict | None = None   # per-stratum counts, when the file carries them
         self._preprocessor = None     # captured from make_pre_post_processors
         self._val_freq = 0            # set from cfg.log_freq * 5 inside patched_make_dataset
         self._resume_step = 0         # for absolute step tracking in wandb
@@ -394,7 +398,11 @@ class TransformRunner:
         """Monkey-patch make_dataset to create train/val/test splits, and capture preprocessor."""
         s = self.config.split_ratio
         total_r = sum(s)
-        if total_r <= 0 or (s[1] <= 0 and (len(s) < 3 or s[2] <= 0)):
+        # --split-file supplies the episode lists directly, so the ratio says nothing
+        # about whether val/test exist — only the file does. Always patch in that case.
+        if not self.config.split_file and (
+            total_r <= 0 or (s[1] <= 0 and (len(s) < 3 or s[2] <= 0))
+        ):
             return  # no val or test, skip patching
 
         import lerobot.datasets.factory as factory_mod
@@ -441,9 +449,41 @@ class TransformRunner:
                 train_ep = loaded_split.get("train_episodes", [])
                 val_ep = loaded_split.get("val_episodes", [])
                 test_ep = loaded_split.get("test_episodes", [])
-                log.info("[split] Loaded random splits from %s", split_info_path)
+                log.info("[split] Loaded splits from checkpoint %s", split_info_path)
             else:
                 train_ep = val_ep = test_ep = None
+
+            # A pre-computed --split-file (e.g. from `stratified-split`) wins over the
+            # random draw, but not over a resumed checkpoint's own split: changing the
+            # split mid-run would leak held-out episodes into training.
+            if train_ep is None and val_state.config.split_file:
+                ext_path = Path(val_state.config.split_file)
+                ext = load_split_info(ext_path)
+                if ext is None:
+                    raise ValueError(f"--split-file={ext_path} could not be read as JSON")
+
+                problems = validate_split_info(ext, total_ep)
+                if problems:
+                    shown = problems[:10]
+                    more = len(problems) - len(shown)
+                    raise ValueError(
+                        f"--split-file={ext_path} does not match this dataset "
+                        f"({total_ep} episodes): {len(problems)} problem(s)\n"
+                        + "\n".join(f"  - {p}" for p in shown)
+                        + (f"\n  ... and {more} more" if more else "")
+                        + "\nRegenerate it against this dataset (stratified-split)."
+                    )
+
+                train_ep = ext.get("train_episodes", [])
+                val_ep = ext.get("val_episodes", [])
+                test_ep = ext.get("test_episodes", [])
+                val_state._split_source = str(ext_path)
+                val_state._split_strategy = ext.get("strategy", "external")
+                val_state._split_strata = ext.get("strata")
+                log.info(
+                    "[split] Loaded %s split from %s (train=%d val=%d test=%d)",
+                    val_state._split_strategy, ext_path, len(train_ep), len(val_ep), len(test_ep),
+                )
 
             if train_ep is None:
                 # Optional: subsample N episodes before splitting
@@ -469,6 +509,9 @@ class TransformRunner:
 
             # Store split info for anvil_config.json (as full lists now)
             val_state._split_info = {
+                "strategy": val_state._split_strategy,
+                **({"split_source": val_state._split_source} if val_state._split_source else {}),
+                **({"strata": val_state._split_strata} if val_state._split_strata else {}),
                 "split_ratio": list(s),
                 "total_episodes": total_ep,
                 "train_episodes": train_ep,
@@ -494,14 +537,14 @@ class TransformRunner:
                 cfg.dataset.episodes = val_ep
                 val_dataset = original_make_dataset(cfg)
                 val_state._val_dataloader = _make_dataloader(val_dataset)
-                log.info("[split] val=%d ep (randomly selected, %d frames)", len(val_ep), val_dataset.num_frames)
+                log.info("[split] val=%d ep (%s, %d frames)", len(val_ep), val_state._split_strategy, val_dataset.num_frames)
 
             # Test dataloader
             if test_ep:
                 cfg.dataset.episodes = test_ep
                 test_dataset = original_make_dataset(cfg)
                 val_state._test_dataloader = _make_dataloader(test_dataset)
-                log.info("[split] test=%d ep (randomly selected, %d frames)", len(test_ep), test_dataset.num_frames)
+                log.info("[split] test=%d ep (%s, %d frames)", len(test_ep), val_state._split_strategy, test_dataset.num_frames)
 
             # Train dataset
             cfg.dataset.episodes = train_ep
@@ -517,12 +560,12 @@ class TransformRunner:
             if _patched_action_stats is not None:
                 train_dataset.meta.stats["action"] = _patched_action_stats
                 log.info("[delta_stats] Patched train_dataset.meta.stats['action'] with delta stats")
-            log.info("[split] train=%d ep (randomly selected)", len(train_ep))
+            log.info("[split] train=%d ep (%s)", len(train_ep), val_state._split_strategy)
             return train_dataset
 
         self._patch(factory_mod, "make_dataset", patched_make_dataset)
         self._patch(lerobot_train_mod, "make_dataset", patched_make_dataset)
-        log.info("[split] Patched make_dataset (split_ratio=%s, random=True)", s)
+        log.info("[split] Patched make_dataset (split_ratio=%s, split_file=%s)", s, self.config.split_file)
 
         # Capture preprocessor when it's created by lerobot
         original_make_processors = policy_factory_mod.make_pre_post_processors
