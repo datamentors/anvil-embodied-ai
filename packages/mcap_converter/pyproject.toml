@@ -53,6 +53,7 @@ dataset-viz = "mcap_converter.cli.dataset_viz:main"
 hf-upload = "mcap_converter.cli.upload:main"
 mcap-to-video = "mcap_converter.cli.video:main"
 merge-datasets = "mcap_converter.cli.merge_datasets:main"
+label-session = "mcap_converter.cli.label_session:main"
 mcap-valid = "mcap_converter.cli.mcap_valid:main"
 
 [project.urls]
