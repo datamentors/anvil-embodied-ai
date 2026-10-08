@@ -61,34 +61,15 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from mcap_converter.cli.stratified_split import _FACE_ALIASES, _SIZE_ALIASES, _norm
+
 # The vocabulary written to disk — kept identical to the recording protocol file
 # so the two describe envelopes with the same words.
 SIZES = ("small", "medium", "big")
 FACES = ("upside", "downside")
 
-# Spellings accepted for --size/--face (English, Portuguese, short forms).
-_SIZE_ALIASES = {
-    "big": "big", "large": "big", "l": "big", "b": "big", "grande": "big",
-    "medium": "medium", "med": "medium", "m": "medium", "medio": "medium", "médio": "medium",
-    "small": "small", "s": "small", "pequeno": "small",
-}
-_FACE_ALIASES = {
-    "face_up": "face_up", "faceup": "face_up", "face-up": "face_up", "up": "face_up",
-    "upside": "face_up", "u": "face_up", "cima": "face_up", "true": "face_up",
-    "face_down": "face_down", "facedown": "face_down", "face-down": "face_down",
-    "down": "face_down", "downside": "face_down", "d": "face_down",
-    "baixo": "face_down", "false": "face_down",
-}
-
-# _FACE_ALIASES normalises to face_up/face_down; map back to the protocol's words.
+# stratified-split normalises to face_up/face_down; map back to the protocol's words.
 _CANONICAL_FACE = {"face_up": "upside", "face_down": "downside"}
-
-
-def _norm(raw, aliases: dict[str, str], what: str) -> str:
-    key = str(raw).strip().lower().replace(" ", "_")
-    if key in aliases:
-        return aliases[key]
-    raise ValueError(f"unrecognised {what} value {raw!r}. Accepted: {sorted(set(aliases))}")
 
 DEFAULT_TASK = {
     "id": "sort_envelopes",

@@ -204,6 +204,17 @@ Anvil-specific flags (stripped before passing to LeRobot):
       Val loss logged every log_freq*5 steps (eval/val_loss).
       Test loss logged every save_freq steps (eval/test_loss).
       Set to --split-ratio=1,0,0 to disable held-out sets.
+      Ignored when --split-file is given.
+
+  --split-file=PATH
+      Use a pre-computed split instead of the random one. PATH is a
+      split_info.json-shaped file listing train/val/test episodes, e.g. from
+      `stratified-split` (stratified by envelope size x face).
+      The episode indices are validated against the dataset, so a stale file
+      from a smaller dataset is rejected rather than silently misapplied.
+      When resuming, the checkpoint's own split still wins — swapping splits
+      mid-run would leak held-out episodes into training.
+      Omit the flag to keep the current behaviour (seeded random split).
 
   --job_name=NAME
       Human-readable run name. Checkpoints saved to model_zoo/<name>/.
