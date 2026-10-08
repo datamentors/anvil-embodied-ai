@@ -27,6 +27,7 @@ from mcap_converter.core.extractor import BufferedStreamExtractor
 def make_config() -> DataConfig:
     """Bimanual quest-teleop-style config matching the real bug scenario."""
     return DataConfig(
+        action_match="nearest",
         action_topics={
             "/follower_l_forward_position_controller/commands": ActionTopicConfig(
                 arm="left", joint_order=["joint1", "joint2"]

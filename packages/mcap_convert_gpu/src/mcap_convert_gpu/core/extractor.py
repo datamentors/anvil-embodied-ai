@@ -607,6 +607,10 @@ class BufferedStreamExtractor:
         # window, so a command published long ago can still be reused.
         self._last_known_action: Dict[str, np.ndarray] = {}
 
+        # Retain only commands that have become causal for a processed frame
+        # or have aged out of the buffer. Reading ahead must not update this.
+        self._last_causal_action: Dict[str, Tuple[float, np.ndarray]] = {}
+
         # Per-robot, per-episode gap-fill counters, keyed by robot then by
         # one of "exact" | "hold_last" | "fallback_to_observation" | "dropped".
         # Reset implicitly per episode because BufferedStreamExtractor is
@@ -1089,6 +1093,20 @@ class BufferedStreamExtractor:
         ready_frame["action"] = future_state.copy()
         return ready_frame
 
+    def _find_last_at_or_before(
+        self,
+        buffer: deque,
+        target_ts: float,
+    ) -> Optional[int]:
+        """Find the newest buffered command at or before the frame timestamp."""
+        idx = None
+        for i, item in enumerate(buffer):
+            if item[0] <= target_ts:
+                idx = i
+            else:
+                break
+        return idx
+
     def _find_nearest_in_buffer(
         self,
         buffer: deque,
@@ -1134,28 +1152,31 @@ class BufferedStreamExtractor:
         Resolve the action position for one robot at target_ts, forward-filling
         when the arm is disengaged (no live command in the sliding buffer).
 
-        Fallback order:
-        1. Nearest command in the live buffer ("exact").
-        2. Last command ever published for this robot, regardless of how long
-           ago ("hold_last") — the arm physically holds its last commanded
-           position when idle, so this reflects reality.
-        3. The robot's current measured joint position from obs_data
-           ("fallback_to_observation") — used when the robot has never
-           published a command yet in this episode (e.g. an idle arm at the
-           very start of a recording).
-        4. None ("dropped") — should not happen in practice since
-           observation data is dense, but kept as a safety net.
-
-        Returns:
-            (position, fill_kind) where position is a copy of the resolved
-            array, or None if fill_kind == "dropped".
+        Commands are selected as complete arm/gripper vectors. Causal mode
+        holds only past commands; before the first command it uses measured state.
         """
-        if buffer:
-            nearest_idx = self._find_nearest_in_buffer(buffer, target_ts)
-            _, pos, _, _ = buffer[nearest_idx]
-            return pos.copy(), "exact"
+        causal = getattr(self.config, "action_match", "causal") == "causal"
 
-        last_known = self._last_known_action.get(robot)
+        if buffer:
+            idx = (
+                self._find_last_at_or_before(buffer, target_ts)
+                if causal
+                else self._find_nearest_in_buffer(buffer, target_ts)
+            )
+            if idx is not None:
+                cmd_ts, pos, _, _ = buffer[idx]
+                if causal:
+                    self._remember_causal_action(robot, cmd_ts, pos)
+                return pos.copy(), "exact"
+
+        # A parked arm keeps its last target, even beyond the fresh-command
+        # age threshold. In causal mode that target must be from the past;
+        # the last message read can be ahead of the frame being constructed.
+        if causal:
+            held = self._last_causal_action.get(robot)
+            last_known = held[1] if held is not None and held[0] <= target_ts else None
+        else:
+            last_known = self._last_known_action.get(robot)
         if last_known is not None:
             return last_known.copy(), "hold_last"
 
@@ -1163,6 +1184,12 @@ class BufferedStreamExtractor:
             return obs_data[robot]["pos"].copy(), "fallback_to_observation"
 
         return None, "dropped"
+
+    def _remember_causal_action(self, robot: str, timestamp: float, pos: np.ndarray) -> None:
+        """Retain the newest eligible command without aliasing its buffer storage."""
+        previous = self._last_causal_action.get(robot)
+        if previous is None or timestamp >= previous[0]:
+            self._last_causal_action[robot] = (timestamp, pos.copy())
 
     def _record_action_fill(self, robot: str, fill_kind: str) -> None:
         """Increment the per-robot, per-episode gap-fill counter."""
@@ -1385,10 +1412,12 @@ class BufferedStreamExtractor:
             joint_buffers: Joint state buffers to sync
             oldest_camera_ts: Timestamp of oldest remaining camera frame
         """
-        for key, data in joint_buffers.items():
+        for (role, robot), data in joint_buffers.items():
             buffer = data["buffer"]
             while buffer and buffer[0][0] < oldest_camera_ts:
-                buffer.popleft()
+                timestamp, pos, _, _ = buffer.popleft()
+                if role == "action":
+                    self._remember_causal_action(robot, timestamp, pos)
 
     def _get_joint_names(
         self,

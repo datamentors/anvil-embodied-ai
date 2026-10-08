@@ -104,6 +104,19 @@ Pick the config that matches your recording setup. `--config` is technically opt
 
 `_16x9` variants set `image_resolution: [480, 270]`, an exact ÷4 downscale of 1920×1080 source cameras with zero letterbox padding. Use the matching `_16x9` config instead of the 4:3 default if your cameras natively output 1920×1080 — see [docs/training.md](training.md#diffusion) for details.
 
+**Command actions (default)** — the normal Quest configs use recorded position
+commands (`action_from_observation: false`). `action_match: causal` selects the
+newest command at or before the reference camera timestamp, keeping each arm
+and its gripper together. An idle arm retains its last causal command; before
+its first eligible command, its measured position is used. Reading ahead never
+makes a future command eligible. Explicit
+`action_match: nearest` retains the older nearest-neighbour behaviour and can
+select future commands. The `_afo.yaml` configs remain an explicit opt-in.
+
+Reconvert command datasets produced with the old `hold_last` fallback into a
+new output directory. Do not append corrected episodes with `--resume`, because
+that would mix temporal selection rules within one dataset.
+
 **action_from_observation** — used by the single- and bimanual `_afo.yaml` configs when `/follower_*/commands` was not recorded or should not be used. Instead of reading from command topics, the converter derives actions from the follower's own joint positions shifted N output frames forward in time. When enabled, configured command topics are ignored even if they exist in the recording. Enable it with a positive lookahead:
 
 ```yaml
