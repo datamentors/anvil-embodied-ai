@@ -180,7 +180,8 @@ class DataConfig:
 
     # Image resolution configuration
     # Target resolution for resizing images before adding to dataset
-    # Format: [width, height]
+    # Format: [width, height]. Only the width is used: mcap-convert derives the
+    # height from the cameras' native aspect ratio (images are never padded).
     image_resolution: List[int] = field(
         default_factory=lambda: [640, 480]  # [width, height]
     )

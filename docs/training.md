@@ -318,19 +318,17 @@ uv run anvil-trainer \
 | `--policy.down_dims` | `[512,1024,2048]` | `[256,512,1024]` | Smaller UNet reduces overfitting on small datasets |
 | `--backbone` | `resnet18` | `resnet18` | Auto-disables GroupNorm for pretrained ImageNet weights |
 
-**Image resolution — avoid letterbox waste**
+**Image resolution**
 
-If your cameras natively output 1920×1080 (16:9) but the dataset was converted with the default `image_resolution: [640, 480]` (4:3), the converter's aspect-preserving resize pads roughly 25% of every frame with black bars — wasted activation memory and diluted visual signal, for zero information gained.
+The converter keeps the cameras' aspect ratio: `image_resolution` sets the output width and the height follows the camera (1920×1080 → 640×360). Datasets converted before this change were letterboxed to 640×480 — roughly 25% of every frame is black bars baked into the stored video pixels, so `--policy.resize_shape` at train time can't recover it. Reconvert those datasets.
 
-Use the matching `_16x9` converter config instead — e.g. `configs/mcap_converter/openarm_bimanual_quest_16x9.yaml` — which sets `image_resolution: [480, 270]`, an exact ÷4 downscale of 1920×1080 with zero padding:
+For a smaller per-image tensor, use a `_16x9` converter config — e.g. `configs/mcap_converter/openarm_bimanual_quest_16x9.yaml` — which writes 480×270, an exact ÷4 downscale of 1920×1080:
 
 ```bash
 uv run mcap-convert -i data/raw_sessions/my-session \
   --config configs/mcap_converter/openarm_bimanual_quest_16x9.yaml \
   -o data/datasets
 ```
-
-This requires reconverting the dataset — the black bars are baked into the stored video pixels, so `--policy.resize_shape` at train time can only shrink them further, it can't recover the wasted 25%.
 
 **Steps and batch size**
 
@@ -340,7 +338,7 @@ Two levers raise the practical batch-size ceiling on a 24 GB GPU well past the o
 
 | Lever | How | Effect |
 |---|---|---|
-| 16:9 dataset conversion | Use a `_16x9` converter config (above) | Removes ~25% letterbox waste, smaller per-image tensor |
+| Narrower dataset images | Use a `_16x9` converter config (480×270, above) | Smaller per-image tensor than the 640-wide default |
 | bf16 mixed precision | `export ACCELERATE_MIXED_PRECISION=bf16` before training | Roughly halves activation memory. Zero code change: `anvil-trainer` calls LeRobot's `lerobot_train()` directly, and `Accelerate()` reads this env var automatically |
 
 ```bash
