@@ -1,0 +1,15 @@
+{
+  "board": "charuco:10x8:0.030:0.015:4x4_50:legacy",
+  "cams": [
+    "head",
+    "hand_left",
+    "hand_right"
+  ],
+  "host": "localhost.localdomain",
+  "started_unix": 1792576851.643187,
+  "still_mm": 2.0,
+  "still_deg": 0.3,
+  "board_still_px": 1.5,
+  "min_move_m": 0.03,
+  "min_rot_deg": 7.0
+}

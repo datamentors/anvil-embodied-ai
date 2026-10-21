@@ -1,0 +1,27 @@
+# AgiBot G2: frames, TF and factory intrinsics through AgiBot's GDK (read-only getters).
+robot: g2
+source:
+  type: gdk
+  image_timeout_ms: 200
+  vendor_param_dir: /data/parameters/sensor   # live vendor calibration; only read
+stillness:
+  type: tf                  # base_link -> each camera's `parent` frame
+  still_mm: 2.0
+  still_deg: 0.3
+output: agibot_json         # results/intrinsic_*.json, named like the vendor files
+runs_dir: /data/dercio-build/g2_camera_calib/runs
+max_samples: 80
+
+cameras:
+  head:
+    gdk: kHeadColor
+    parent: head_link3
+    vendor_intrinsic: intrinsic_head_front_rgb.json
+  hand_left:
+    gdk: kHandLeftColor
+    parent: arm_l_end_link
+    vendor_intrinsic: intrinsic_hand_left_rgb.json
+  hand_right:
+    gdk: kHandRightColor
+    parent: arm_r_end_link
+    vendor_intrinsic: intrinsic_hand_right_rgb.json

@@ -1,0 +1,26 @@
+# Anvil workcell (OpenArm + usb_cam): frames and joint states over the stack's rosbridge.
+# Template for any ROS 2 robot running rosbridge_server.
+robot: anvil
+source:
+  type: rosbridge
+  url: ws://127.0.0.1:9090
+  throttle_ms: 200          # per-camera frame interval requested from rosbridge
+stillness:
+  type: joint_states
+  topic: /joint_states
+  still_rad: 0.002
+output: ros_camera_info     # results/<cam>.yaml, loadable by usb_cam's camera_info_url
+factory_note: "usb_cam camera_info_url = dummy_camera_info.yaml"
+runs_dir: runs              # relative = inside this package folder
+max_samples: 120
+
+cameras:
+  cam_chest:
+    topic: /cam_chest/image_raw/compressed
+    v4l2_device: /run/cameras/cam_chest
+  cam_wrist_l:
+    topic: /cam_wrist_l/image_raw/compressed
+    v4l2_device: /run/cameras/cam_wrist_l
+  cam_wrist_r:
+    topic: /cam_wrist_r/image_raw/compressed
+    v4l2_device: /run/cameras/cam_wrist_r

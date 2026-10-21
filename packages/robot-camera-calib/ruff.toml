@@ -1,0 +1,9 @@
+# Repo rules plus Google-style docstrings for this package.
+extend = "../../../pyproject.toml"
+
+[lint]
+extend-select = ["D"]
+ignore = ["D107"]  # Google style: __init__ args are documented in the class docstring
+
+[lint.pydocstyle]
+convention = "google"
