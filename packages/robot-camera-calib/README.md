@@ -17,6 +17,21 @@ Adding another robot is a YAML file: see
 - **Results are candidates.** They are written into the run folder only.
   Installing them is a separate, manual decision (see the end).
 
+## Where calibration files live
+
+| What | Default location | Format |
+|---|---|---|
+| Capture runs | `runs_dir` of the robot's YAML: G2 `/data/dercio-build/g2_camera_calib/runs/<run>/`, Anvil `runs/<run>/` in this package | images + `meta.json` per sample |
+| New calibration (solve) | `<run>/results/` | G2 `intrinsic_*.json`, ROS `<cam>.yaml` |
+| Kept calibrations | [`calibrations/<robot serial>_<date>_<run>/`](calibrations/) in this package | as `results/` |
+| Robot's live calibration (G2) | `/data/parameters/sensor/intrinsic_*.json` on the robot | AgiBot JSON |
+| Raw datasets (S3) | `s3://ardia-ai-datasets-dev/raw/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/<episode>/files/data/parameters/sensor/intrinsic_*.json` | AgiBot JSON, as recorded |
+| Processed datasets (NAS) | `/mnt/nas/processed/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/meta/camera_calibration.json` | `{video_key: 3x3 matrix}` |
+
+Example `<use_case>/<task>/<embodiment>/<setup>/<date>/<session>`:
+`cloth_folding/fold_towel/agibot_g2/g2a0004-infpose-headset/2026-10-21/s01`. Full file
+examples: [Calibration in recorded datasets](#calibration-in-recorded-datasets).
+
 ## Requirements
 
 Python 3.10+, OpenCV >= 4.7 with `aruco` (`CharucoDetector`), NumPy, PyYAML, and
@@ -118,92 +133,77 @@ python3 -m robot_camera_calib.selftest      # or ./run.sh selftest
 - **ROS robots:** copy `results/<cam>.yaml` where the camera driver can read it and
   point its `camera_info_url` at it (`file:///...`).
 
-## Calibration in processed datasets
+## Calibration in recorded datasets
 
-Raw recordings keep the robot's own calibration files next to the images. When a
-recording is converted to a LeRobot dataset with **undistorted** frames, the dataset
-must say exactly which calibration was used. Every robot's converter writes the same
-file for that:
+### Raw (S3, as recorded)
+
+The robot's own calibration files travel with every episode, unchanged. For the G2 the
+recorder snapshots `/data/parameters/sensor` into each episode, and `g2_ingest` uploads
+the episode byte-for-byte:
+
+```
+s3://ardia-ai-datasets-dev/raw/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/<episode>/files/data/parameters/sensor/
+    intrinsic_head_front_rgb.json     {"Fx", "Fy", "Cx", "Cy", "k1", "k2", "p1", "p2", "k3", "SN"}
+    intrinsic_hand_left_rgb.json
+    intrinsic_hand_right_rgb.json
+    ...                               (the robot's other sensor files)
+```
+
+Example prefix: `raw/cloth_folding/fold_towel/agibot_g2/g2a0004-infpose-headset/2026-10-21/s01/`.
+Raw frames are the camera's real (distorted) images, so they go with these K and D.
+A complete `intrinsic_hand_left_rgb.json` (G2A0004 factory values):
+
+```json
+{"Fx": 479.7045091050678, "Fy": 479.4579738879909, "Cx": 640.495468237256, "Cy": 524.096396833031,
+ "k1": -0.04784519575146247, "k2": -0.010293807152412444, "p1": -9.44150220740944e-05,
+ "p2": 6.984914892529563e-05, "k3": 0.0019575327156301317, "SN": "FD63711400004af3"}
+```
+
+### Processed (LeRobot datasets)
+
+Processed frames are **undistorted**: each frame is remapped with its episode's K and D
+to an ideal pinhole camera, so the dataset only needs that camera's matrix, with zero
+distortion. It goes in one file per dataset, next to LeRobot's `meta/info.json`:
 
 ```
 <dataset>/meta/camera_calibration.json
 ```
 
-It sits next to LeRobot's own `meta/info.json`. Matrices are OpenCV-shaped (3x3 `K`,
-5-element `D` = `[k1, k2, p1, p2, k3]`), so they load straight into `np.array(...)`.
+For the G2 the dataset root is the same path on the NAS (`//192.168.1.3/Datasets`,
+mounted at `/mnt/nas` on the workstation):
 
-**Per camera** (keyed by the dataset's video key, e.g. `observation.images.hand_left`):
+```
+/mnt/nas/processed/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/meta/camera_calibration.json
+```
 
-| Field | Meaning |
-|---|---|
-| `camera_matrix` | K of the **raw** camera: `[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]`, pixels |
-| `dist_coeffs` | D of the **raw** camera: `[k1, k2, p1, p2, k3]` (OpenCV plumb_bob) |
-| `rectified_camera_matrix` | K of the **stored, undistorted** frames; their distortion is zero |
-| `width`, `height` | frame size in pixels; raw and undistorted are the same size |
-| `source_camera` | the robot's camera name (G2: `hand_left_color`) |
-| `vendor_file` | the robot calibration file it was read from (G2: `intrinsic_hand_left_rgb.json`) |
-| `serial` | camera serial number from that file, if it has one |
-| `vendor_values` | that file, copied verbatim |
-| `sha256` | hash of that file, proving exactly which calibration was used |
-
-**Top level:**
-
-| Field | Meaning |
-|---|---|
-| `format` | layout version, currently `g2_camera_calibration/v1` |
-| `frames` | `undistorted ...` or `distorted ...`: which K applies to the stored videos |
-| `model`, `source`, `usage` | plain-text notes: the lens model, where the values came from, how to reproduce the frames |
-| `cameras` | the per-camera block above, when every episode used the same calibration (the normal case); `null` otherwise |
-| `calibrations` | every distinct calibration set, keyed by a short id (one entry normally, equal to `cameras`) |
-| `episodes` | per dataset episode: `episode_index`, `source_episode` (raw recording name) and the `calibration` id it used |
-
-How the stored frames were made, for every pixel:
-`cv2.undistort(raw, camera_matrix, dist_coeffs, newCameraMatrix=rectified_camera_matrix)`,
-with `rectified_camera_matrix = cv2.getOptimalNewCameraMatrix(K, D, (w, h), alpha=0)` (same
-size, no black border).
-
-Example: AgiBot G2, one camera shown, numbers rounded. In the G2 pipeline the values come
-from `<episode>/files/data/parameters/sensor/intrinsic_*.json`, the snapshot of
-`/data/parameters/sensor` the recorder stores with every episode.
+The file maps each video key to its 3x3 camera matrix `[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]`
+in pixels, and nothing else. A complete file, AgiBot G2 from its factory calibration
+(`/mnt/nas/processed/cloth_folding/fold_towel/agibot_g2/g2a0004-infpose-headset/2026-10-21/s01/meta/camera_calibration.json`):
 
 ```json
 {
-  "format": "g2_camera_calibration/v1",
-  "frames": "undistorted -- ... use rectified_camera_matrix with zero distortion for these frames",
-  "cameras": {
-    "observation.images.hand_left": {
-      "source_camera": "hand_left_color",
-      "vendor_file": "intrinsic_hand_left_rgb.json",
-      "serial": "FD63711400004af3",
-      "width": 1280, "height": 1056,
-      "camera_matrix": [[479.70, 0.0, 640.50], [0.0, 479.46, 524.10], [0.0, 0.0, 1.0]],
-      "dist_coeffs": [-0.04785, -0.01029, -0.0000944, 0.0000698, 0.00196],
-      "rectified_camera_matrix": [[407.46, 0.0, 641.44], [0.0, 438.84, 522.97], [0.0, 0.0, 1.0]],
-      "vendor_values": {"Fx": 479.70, "Fy": 479.46, "Cx": 640.50, "Cy": 524.10, "k1": -0.04785, "...": "...", "SN": "FD63711400004af3"},
-      "sha256": "3b5726da..."
-    }
-  },
-  "calibrations": {"26801bfc28a9": "<same as cameras>"},
-  "episodes": [{"episode_index": 0, "source_episode": "folding_towels(infPose)014_001", "calibration": "26801bfc28a9"}]
+  "observation.images.top_head":   [[302.33, 0.0, 316.46], [0.0, 302.59, 203.54], [0.0, 0.0, 1.0]],
+  "observation.images.hand_left":  [[407.46, 0.0, 641.44], [0.0, 438.84, 522.97], [0.0, 0.0, 1.0]],
+  "observation.images.hand_right": [[411.26, 0.0, 644.18], [0.0, 441.83, 530.21], [0.0, 0.0, 1.0]]
 }
 ```
 
-Reading it back:
-
 ```python
 import json, numpy as np
-cam = json.load(open("<dataset>/meta/camera_calibration.json"))["cameras"]["observation.images.hand_left"]
-K_raw, D_raw = np.array(cam["camera_matrix"]), np.array(cam["dist_coeffs"])  # raw images
-K = np.array(cam["rectified_camera_matrix"])                                 # dataset frames, no distortion
+K = np.array(json.load(open("<dataset>/meta/camera_calibration.json"))["observation.images.hand_left"])
 ```
 
-If `cameras` is `null` (the robot was recalibrated mid-session), look up the episode in
-`episodes` and read `calibrations[<id>]` instead.
+How the stored frames were made from the raw ones:
+`K_new = cv2.getOptimalNewCameraMatrix(K, D, (w, h), alpha=0)` (same size, no black
+border), then `cv2.undistort(raw, K, D, newCameraMatrix=K_new)`; `K_new` is what the file
+stores. A policy trained on these frames needs the same remap on the robot's live images.
 
-Adding a robot: map each converted camera to its calibration file and read K and D from
-it. A ROS `camera_info` YAML gives `K` (`camera_matrix.data`) and `D` (`distortion_coefficients.data`)
-directly. Then write this same file. Keep `frames` truthful: a dataset whose videos were
-not undistorted says `distorted` and is used with `camera_matrix` + `dist_coeffs`.
+One matrix per camera holds for the whole dataset: if the robot's calibration changed
+between episodes, the converter stops and that session has to be split. Datasets with
+distorted frames get no `camera_calibration.json`.
+
+**Another robot:** undistort with its own K and D (for a ROS camera, `camera_matrix.data`
+and `distortion_coefficients.data` of its `camera_info`) and write this same file.
 
 ## Files
 

@@ -109,6 +109,30 @@ First run checklist:
   `moving` means `still_rad` is too tight for your joint noise.
 - Show the board: the live view tile turns orange, then green when it saves.
 
+## 4. Where the results go
+
+| What | Default location |
+|---|---|
+| Capture run | `<runs_dir>/<run>/` (`runs_dir` from your YAML; relative = inside the package) |
+| Calibration result | `<runs_dir>/<run>/results/<cam>.yaml` (ROS) or `intrinsic_*.json` (AgiBot) |
+| Kept calibration | `calibrations/<robot serial>_<date>_<run>/` in the package |
+| Calibration of a processed (undistorted) dataset | `<dataset>/meta/camera_calibration.json` |
+
+For recorded datasets, raw episodes keep the robot's own calibration files next to the
+images, and a processed dataset with undistorted frames gets
+`<dataset>/meta/camera_calibration.json`: one 3x3 camera matrix per video key, nothing
+else. A complete file for a robot with two cameras:
+
+```json
+{
+  "observation.images.front": [[612.40, 0.0, 641.10], [0.0, 611.95, 362.80], [0.0, 0.0, 1.0]],
+  "observation.images.wrist": [[455.20, 0.0, 318.70], [0.0, 455.05, 241.30], [0.0, 0.0, 1.0]]
+}
+```
+
+The G2 paths (S3 raw, NAS processed) and its real values are in the
+[package README](../README.md#where-calibration-files-live).
+
 ## Code layout
 
 | File | Role |
