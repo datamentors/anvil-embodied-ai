@@ -25,7 +25,8 @@ Adding another robot is a YAML file: see
 | New calibration (solve) | `<run>/results/` | G2 `intrinsic_*.json`, ROS `<cam>.yaml` |
 | Kept calibrations | [`calibrations/<robot serial>_<date>_<run>/`](calibrations/) in this package | as `results/` |
 | Robot's live calibration (G2) | `/data/parameters/sensor/intrinsic_*.json` on the robot | AgiBot JSON |
-| Raw datasets (S3) | `s3://ardia-ai-datasets-dev/raw/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/<episode>/files/data/parameters/sensor/intrinsic_*.json` | AgiBot JSON, as recorded |
+| Raw datasets (S3), per session | `s3://ardia-ai-datasets-dev/raw/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/meta/camera_calibration.json` | `{camera: K, D, width, height}` |
+| Raw datasets (S3), per episode | `.../<session>/<episode>/files/data/parameters/sensor/intrinsic_*.json` | AgiBot JSON, as recorded |
 | Processed datasets (NAS) | `/mnt/nas/processed/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/meta/camera_calibration.json` | `{video_key: 3x3 matrix}` |
 
 Example `<use_case>/<task>/<embodiment>/<setup>/<date>/<session>`:
@@ -137,9 +138,34 @@ python3 -m robot_camera_calib.selftest      # or ./run.sh selftest
 
 ### Raw (S3, as recorded)
 
-The robot's own calibration files travel with every episode, unchanged. For the G2 the
-recorder snapshots `/data/parameters/sensor` into each episode, and `g2_ingest` uploads
-the episode byte-for-byte:
+Raw frames are the camera's real (distorted) images, so raw carries K **and** D. One file
+per session, next to `session.json`, written by `g2_ingest` from the episodes'
+calibration snapshots (which must be identical within the session):
+
+```
+s3://ardia-ai-datasets-dev/raw/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/meta/camera_calibration.json
+```
+
+```json
+{
+  "head_color": {
+    "camera_matrix": [[305.0217, 0.0, 316.5253], [0.0, 305.0068, 203.4567], [0.0, 0.0, 1.0]],
+    "dist_coeffs": [-0.0306006, 0.0336422, 0.0001407, -0.0000557, -0.0119387],
+    "width": 640, "height": 400
+  },
+  "hand_left_color": {
+    "camera_matrix": [[479.7045, 0.0, 640.4955], [0.0, 479.4580, 524.0964], [0.0, 0.0, 1.0]],
+    "dist_coeffs": [-0.0478452, -0.0102938, -0.0000944, 0.0000698, 0.0019575],
+    "width": 1280, "height": 1056
+  },
+  "hand_right_color": { "...": "same fields" }
+}
+```
+
+This is the calibration the processed frames were undistorted with, so it is also the
+one to reuse on new data. The robot's own files still travel with every episode,
+unchanged: for the G2 the recorder snapshots `/data/parameters/sensor` into each
+episode, and `g2_ingest` uploads the episode byte-for-byte:
 
 ```
 s3://ardia-ai-datasets-dev/raw/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/<episode>/files/data/parameters/sensor/
