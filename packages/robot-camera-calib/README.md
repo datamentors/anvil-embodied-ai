@@ -25,9 +25,9 @@ Adding another robot is a YAML file: see
 | New calibration (solve) | `<run>/results/` | G2 `intrinsic_*.json`, ROS `<cam>.yaml` |
 | Kept calibrations | [`calibrations/<robot serial>_<date>_<run>/`](calibrations/) in this package | as `results/` |
 | Robot's live calibration (G2) | `/data/parameters/sensor/intrinsic_*.json` on the robot | AgiBot JSON |
-| Raw datasets (S3), per session | `s3://ardia-ai-datasets-dev/raw/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/meta/camera_calibration.json` | `{camera: K, D, width, height}` |
+| Raw datasets (S3), per session | `s3://ardia-ai-datasets-dev/raw/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/meta/camera_calibration.json` | `{camera: K, D, width, height}` (same layout as processed) |
 | Raw datasets (S3), per episode | `.../<session>/<episode>/files/data/parameters/sensor/intrinsic_*.json` | AgiBot JSON, as recorded |
-| Processed datasets (NAS) | `/mnt/nas/processed/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/meta/camera_calibration.json` | `{video_key: 3x3 matrix}` |
+| Processed datasets (NAS) | `/mnt/nas/processed/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/meta/camera_calibration.json` | `{video_key: K_new, D = 0, width, height}` |
 
 Example `<use_case>/<task>/<embodiment>/<setup>/<date>/<session>`:
 `cloth_folding/fold_towel/agibot_g2/g2a0004-infpose-headset/2026-10-21/s01`. Full file
@@ -202,21 +202,39 @@ mounted at `/mnt/nas` on the workstation):
 /mnt/nas/processed/<use_case>/<task>/<embodiment>/<setup>/<date>/<session>/meta/camera_calibration.json
 ```
 
-The file maps each video key to its 3x3 camera matrix `[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]`
-in pixels, and nothing else. A complete file, AgiBot G2 from its factory calibration
+Same layout as the raw session file, keyed by the dataset's video keys: per camera the
+`camera_matrix` of the stored frames (`[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]`, pixels),
+`dist_coeffs` all zero (the frames are undistorted) and the frame size. A complete file, AgiBot G2 from its factory calibration
 (`/mnt/nas/processed/cloth_folding/fold_towel/agibot_g2/g2a0004-infpose-headset/2026-10-21/s01/meta/camera_calibration.json`):
 
 ```json
 {
-  "observation.images.top_head":   [[302.33, 0.0, 316.46], [0.0, 302.59, 203.54], [0.0, 0.0, 1.0]],
-  "observation.images.hand_left":  [[407.46, 0.0, 641.44], [0.0, 438.84, 522.97], [0.0, 0.0, 1.0]],
-  "observation.images.hand_right": [[411.26, 0.0, 644.18], [0.0, 441.83, 530.21], [0.0, 0.0, 1.0]]
+  "observation.images.top_head": {
+    "camera_matrix": [[302.33, 0.0, 316.46], [0.0, 302.59, 203.54], [0.0, 0.0, 1.0]],
+    "dist_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+    "width": 640, "height": 400
+  },
+  "observation.images.hand_left": {
+    "camera_matrix": [[407.46, 0.0, 641.44], [0.0, 438.84, 522.97], [0.0, 0.0, 1.0]],
+    "dist_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+    "width": 1280, "height": 1056
+  },
+  "observation.images.hand_right": {
+    "camera_matrix": [[411.26, 0.0, 644.18], [0.0, 441.83, 530.21], [0.0, 0.0, 1.0]],
+    "dist_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+    "width": 1280, "height": 1056
+  }
 }
 ```
 
+Raw holds the real camera (K, D), used to make these frames and to reuse on new data;
+processed holds the camera of its own frames (`K_new`, no distortion). `K_new` follows
+from the raw values: `cv2.getOptimalNewCameraMatrix(K, D, (w, h), alpha=0)`.
+
 ```python
 import json, numpy as np
-K = np.array(json.load(open("<dataset>/meta/camera_calibration.json"))["observation.images.hand_left"])
+cam = json.load(open("<dataset>/meta/camera_calibration.json"))["observation.images.hand_left"]
+K = np.array(cam["camera_matrix"])  # dataset frames; distortion is zero
 ```
 
 How the stored frames were made from the raw ones:
