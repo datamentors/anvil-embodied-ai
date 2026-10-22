@@ -81,7 +81,8 @@ camera_topic_mapping:
   "/cam_wrist_r/image_raw/compressed": "wrist_r"
   "/cam_chest/image_raw/compressed": "chest"
 
-# Target image resolution [width, height]
+# Image resolution [width, height]. Only the width is used: the height follows the
+# cameras' native aspect ratio, so frames are never letterbox-padded.
 image_resolution: [640, 480]
 
 

@@ -93,16 +93,16 @@ Converts every episode in a target session (`--input-dir`) into one LeRobot v3.0
 
 Pick the config that matches your recording setup. `--config` is technically optional — omitting it falls back to a bare default `DataConfig()` that doesn't match any real robot's topic layout — so in practice always pass one of these:
 
-| Config | Teleop mode | Arms | Action source | Camera aspect |
-|--------|-------------|------|---------------|---------------|
-| `openarm_bimanual.yaml` | Leader-follower | Bimanual | Leader joint positions | 4:3 (640×480) |
-| `openarm_bimanual_quest.yaml` | Quest VR | Bimanual | Command topics | 4:3 (640×480) |
-| `openarm_bimanual_quest_afo.yaml` | Quest VR | Bimanual | Observation lookahead | 4:3 (640×480) |
-| `openarm_bimanual_quest_16x9.yaml` | Quest VR | Bimanual | Command topics | 16:9 (480×270) |
-| `openarm_single_quest.yaml` | Quest VR | Single (right) | Command topics | 4:3 (640×480) |
-| `openarm_single_quest_afo.yaml` | Quest VR | Single (right) | Observation lookahead | 4:3 (640×480) |
+| Config | Teleop mode | Arms | Action source | Image width |
+|--------|-------------|------|---------------|-------------|
+| `openarm_bimanual.yaml` | Leader-follower | Bimanual | Leader joint positions | 640 |
+| `openarm_bimanual_quest.yaml` | Quest VR | Bimanual | Command topics | 640 |
+| `openarm_bimanual_quest_afo.yaml` | Quest VR | Bimanual | Observation lookahead | 640 |
+| `openarm_bimanual_quest_16x9.yaml` | Quest VR | Bimanual | Command topics | 480 |
+| `openarm_single_quest.yaml` | Quest VR | Single (right) | Command topics | 640 |
+| `openarm_single_quest_afo.yaml` | Quest VR | Single (right) | Observation lookahead | 640 |
 
-`_16x9` variants set `image_resolution: [480, 270]`, an exact ÷4 downscale of 1920×1080 source cameras with zero letterbox padding. Use the matching `_16x9` config instead of the 4:3 default if your cameras natively output 1920×1080 — see [docs/training.md](training.md#diffusion) for details.
+Only the width of `image_resolution` is used. The height follows the cameras' native aspect ratio, so frames are never letterbox-padded, cropped or stretched: 1920×1080 cameras give 640×360 (or 480×270 with `_16x9`). All cameras in a session must share one aspect ratio — otherwise the conversion stops with an error. Datasets converted before this change were padded to 640×480 with black bars; reconvert them to get full frames — see [docs/training.md](training.md#diffusion).
 
 **Command actions (default)** — the normal Quest configs use recorded position
 commands (`action_from_observation: false`). `action_match: causal` selects the

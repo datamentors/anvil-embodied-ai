@@ -3,11 +3,9 @@
 # =============================================================================
 # Teleop Mode: Quest (VR Controller)
 #
-# Use this config when the source cameras are 1920×1080 (16:9).
-# image_resolution [480, 270] is an exact ÷4 downscale → no black bars.
-# The 4:3 default (openarm_bimanual_quest.yaml) produces ~25% letterbox
-# padding at the top/bottom, wasting activation memory and degrading
-# visual features.
+# Same as openarm_bimanual_quest.yaml but 480 px wide instead of 640, for a
+# smaller per-image tensor. With 1920×1080 (16:9) cameras the output is
+# 480×270, an exact ÷4 downscale.
 #
 # In this mode, actions are sent as position commands via separate ROS2
 # command topics (std_msgs/Float64MultiArray) — one per arm. The
@@ -89,8 +87,9 @@ camera_topic_mapping:
   "/cam_chest/image_raw/compressed": "chest"
   "/cam_wrist_l/image_raw/compressed": "wrist_l"
 
-# Target image resolution [width, height]
-image_resolution: [480, 270]  # 16:9, exact ÷4 of 1920×1080 — no letterbox padding
+# Image resolution [width, height]. Only the width is used: the height follows the
+# cameras' native aspect ratio, so frames are never letterbox-padded.
+image_resolution: [480, 270]  # 1920×1080 cameras → 480×270, an exact ÷4 downscale
 
 
 # =============================================================================

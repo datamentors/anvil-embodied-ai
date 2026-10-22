@@ -15,7 +15,7 @@ import stat
 import sys
 import tempfile
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -52,6 +52,11 @@ from mcap_converter.core.episode_labels import (
 from mcap_converter.core.extractor import BufferedStreamExtractor
 from mcap_converter.core.quality import SEVERITY_CRITICAL, SEVERITY_PASS, SEVERITY_WARNING
 from mcap_converter.core.reader import snap_fps
+from mcap_converter.utils.image_utils import (
+    aspect_ratio_matches,
+    decode_compressed_image,
+    output_resolution,
+)
 
 console = Console()
 
@@ -402,6 +407,74 @@ def quick_scan_joint_names(mcap_path: str, config: DataConfig) -> dict:
     return {}
 
 
+def probe_camera_resolutions(mcap_files: List[Path], config: DataConfig) -> dict:
+    """
+    Native (width, height) of each camera, read from its first image.
+
+    Scans MCAP files in order until every camera has been seen; the first file
+    is normally enough.
+
+    Returns:
+        Dictionary mapping camera name to (width, height)
+    """
+    topic_to_cam = {}
+    for topic in config.camera_topics:
+        topic_to_cam[topic] = config.camera_topic_mapping[topic]
+        topic_to_cam[topic + "/compressed"] = config.camera_topic_mapping[topic]
+    camera_names = set(topic_to_cam.values())
+
+    sizes: dict = {}
+    for mcap_path in mcap_files:
+        reader = McapReader(str(mcap_path))
+        for message in reader.read_messages(topics=list(topic_to_cam)):
+            cam_name = topic_to_cam[message.channel.topic]
+            if cam_name in sizes:
+                continue
+            ros_msg = message.ros_msg
+            if hasattr(ros_msg, "format"):
+                height, width = decode_compressed_image(ros_msg.data, ros_msg.format).shape[:2]
+            else:
+                height, width = ros_msg.height, ros_msg.width
+            sizes[cam_name] = (width, height)
+            if len(sizes) == len(camera_names):
+                return sizes
+
+    missing = sorted(camera_names - set(sizes))
+    raise ValueError(f"No images found for camera(s) {missing} in any MCAP file")
+
+
+def resolve_image_resolution(config: DataConfig, mcap_files: List[Path]) -> DataConfig:
+    """
+    Derive the dataset image resolution from the cameras' native aspect ratio.
+
+    The width comes from config.image_resolution; the height follows the main
+    camera's aspect ratio, so frames are resized without letterbox padding.
+    Every camera must share that aspect ratio.
+
+    Returns:
+        Copy of config with image_resolution set to the resolved [width, height]
+    """
+    sizes = probe_camera_resolutions(mcap_files, config)
+    main_cam = list(config.camera_topic_mapping.values())[0]
+    width, height = output_resolution(sizes[main_cam], config.image_resolution[0])
+
+    mismatched = [
+        f"{cam} {w}x{h}"
+        for cam, (w, h) in sizes.items()
+        if not aspect_ratio_matches((w, h), (width, height))
+    ]
+    if mismatched:
+        main_w, main_h = sizes[main_cam]
+        raise ValueError(
+            f"All cameras must share the main camera's aspect ratio ({main_cam} {main_w}x{main_h}); "
+            f"mismatched: {', '.join(mismatched)}"
+        )
+
+    native = ", ".join(f"{cam} {w}x{h}" for cam, (w, h) in sizes.items())
+    log(f"Image resolution: [bold]{width}x{height}[/bold] [dim](native: {native})[/dim]")
+    return replace(config, image_resolution=[width, height])
+
+
 def _ensure_output_readable(output_dir: str) -> None:
     """
     Ensure every file/directory in the converted dataset is readable by
@@ -622,6 +695,8 @@ def convert_session(
         log(f"Found [bold]{len(mcap_files)}[/bold] MCAP files")
     log(f"Buffered streaming (buffer={buffer_seconds}s)")
 
+    config = resolve_image_resolution(config, mcap_files)
+
     effective_parallel_workers = resolve_parallel_episode_workers(
         parallel_episode_workers,
         len(mcap_files),
@@ -817,6 +892,17 @@ def convert_session(
     if resume_from > 0:
         dataset = writer.load_dataset_for_writing()
         log(f"Loaded existing dataset ({resume_from} episodes already converted)")
+        # Without this check every new frame fails LeRobot's shape validation and
+        # each episode is skipped as a "corrupt frame".
+        image_feature = dataset.meta.features[f"observation.images.{camera_names[0]}"]
+        names, shape = list(image_feature["names"]), image_feature["shape"]
+        stored = (shape[names.index("width")], shape[names.index("height")])
+        if list(stored) != list(config.image_resolution):
+            raise ValueError(
+                f"Existing dataset images are {stored[0]}x{stored[1]} but this conversion "
+                f"produces {config.image_resolution[0]}x{config.image_resolution[1]}; "
+                "reconvert from scratch instead of resuming"
+            )
     else:
         dataset = writer.create_dataset(
             joint_names=joint_names,

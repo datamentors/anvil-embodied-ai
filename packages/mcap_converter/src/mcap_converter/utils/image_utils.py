@@ -135,16 +135,51 @@ def encode_image_to_bytes(img: np.ndarray, format: str = "png") -> bytes:
     return buffer.tobytes()
 
 
+# Relative tolerance for treating two aspect ratios as equal. Covers rounding the
+# derived height to an even number (e.g. 848×480 → 640×362).
+ASPECT_RATIO_TOLERANCE = 0.01
+
+
+def aspect_ratio_matches(size_a: tuple, size_b: tuple) -> bool:
+    """Whether two (width, height) sizes share an aspect ratio within ASPECT_RATIO_TOLERANCE."""
+    ratio_a = size_a[0] / size_a[1]
+    ratio_b = size_b[0] / size_b[1]
+    return abs(ratio_a - ratio_b) <= ASPECT_RATIO_TOLERANCE * ratio_a
+
+
+def output_resolution(source_size: tuple, target_width: int) -> tuple:
+    """
+    Dataset resolution for a camera: the target width, height from the camera's aspect ratio.
+
+    Args:
+        source_size: Native camera (width, height)
+        target_width: Output width in pixels
+
+    Returns:
+        (width, height) with the source aspect ratio. Height is rounded to an even
+        number, as required by yuv420p video encoding.
+    """
+    src_w, src_h = source_size
+    target_h = max(2, round(target_width * src_h / src_w / 2) * 2)
+    return (target_width, target_h)
+
+
 def resize_image(img: np.ndarray, target_size: tuple) -> np.ndarray:
     """
-    Resize image to target size while preserving aspect ratio by padding with black.
+    Resize image to target size. Never pads, crops or stretches.
 
     Args:
         img: Image array (H, W, C) or (H, W)
-        target_size: (width, height) tuple — target canvas size
+        target_size: (width, height) tuple — must have the image's aspect ratio
+            (see output_resolution)
 
     Returns:
-        Image resized to fit within target_size with black padding, shape (H, W, C) or (H, W).
+        Resized image, shape (H, W, C) or (H, W).
+
+    Raises:
+        RuntimeError: If the image aspect ratio differs from target_size. Not a
+            ValueError: the converter skips episodes on ValueError (corrupt frames),
+            whereas a camera/resolution mismatch must stop the run.
     """
     target_w, target_h = target_size
     src_h, src_w = img.shape[:2]
@@ -152,19 +187,11 @@ def resize_image(img: np.ndarray, target_size: tuple) -> np.ndarray:
     if src_w == target_w and src_h == target_h:
         return img
 
-    scale = min(target_w / src_w, target_h / src_h)
-    new_w = int(src_w * scale)
-    new_h = int(src_h * scale)
+    if not aspect_ratio_matches((src_w, src_h), (target_w, target_h)):
+        raise RuntimeError(
+            f"Image is {src_w}x{src_h} but the dataset resolution is {target_w}x{target_h} "
+            "(different aspect ratio). Images are never padded or stretched — all cameras "
+            "must share one aspect ratio."
+        )
 
-    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-
-    if img.ndim == 3:
-        canvas = np.zeros((target_h, target_w, img.shape[2]), dtype=img.dtype)
-    else:
-        canvas = np.zeros((target_h, target_w), dtype=img.dtype)
-
-    offset_x = (target_w - new_w) // 2
-    offset_y = (target_h - new_h) // 2
-    canvas[offset_y : offset_y + new_h, offset_x : offset_x + new_w] = resized
-
-    return canvas
+    return cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
