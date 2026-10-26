@@ -1,0 +1,23 @@
+{
+  "cameras": {
+    "camera1": {
+      "intrinsic": [382.504638671875, 382.1854553222656, 314.400390625, 244.95474243164062],
+      "distortion": [-0.05546576529741287, 0.06426770240068436, -0.0005513033829629421, -0.0006251728045754135, -0.02131209895014763],
+      "width": 640, "height": 480, "distortion_model": "plumb_bob",
+      "topic": "/camera/camera1/color/camera_info"
+    },
+    "camera2": {
+      "intrinsic": [386.70220947265625, 386.4916687011719, 325.630126953125, 242.89169311523438],
+      "distortion": [-0.053976111114025116, 0.061196792870759964, -0.0013526915572583675, 0.0008028543088585138, -0.018996303901076317],
+      "width": 640, "height": 480, "distortion_model": "plumb_bob",
+      "topic": "/camera/camera2/color/camera_info"
+    },
+    "camera3": {
+      "intrinsic": [381.4930725097656, 381.2786560058594, 324.7376708984375, 238.21389770507812],
+      "distortion": [-0.04566478729248047, 0.04938838630914688, -0.0012861886061728, 0.0009880951838567853, -0.012039653025567532],
+      "width": 640, "height": 480, "distortion_model": "plumb_bob",
+      "topic": "/camera/camera3/color/camera_info"
+    }
+  },
+  "note": "realman: realsense2_camera camera_info (D457 factory calibration), copied by hand 2026-10-23"
+}

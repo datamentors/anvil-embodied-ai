@@ -1,0 +1,25 @@
+# RealMan RMC-AIDAL-III (IO-AI kit): 3x RealSense D457 (GMSL) over rosbridge.
+# Stack: ~/io_teleop_v3_realman_ros2_ws/run.sh, ROS 2 Humble, ROS_DOMAIN_ID=42.
+# Camera names follow the driver topics: camera1 = left, camera2 = centre, camera3 = right.
+robot: realman
+source:
+  type: rosbridge
+  url: ws://127.0.0.1:9090
+  throttle_ms: 200
+stillness:
+  type: none                # board-still gate rejects blur
+  # with the arm stack up: {type: joint_states, topic: /io_teleop/joint_states, still_rad: 0.002}
+output: ros_camera_info
+factory_note: "D457 factory values from camera_info, copied into factory.json before solve"
+runs_dir: runs
+max_samples: 120
+
+cameras:
+  camera1:                  # left, serial 035622250076
+    topic: /camera/camera1/color/image_raw/compressed
+  camera2:                  # centre, serial 343622300400
+    # run.sh rotates this image 180 deg (rotation_filter) but its camera_info is not
+    # rotated: the driver's factory K/D do not match the published frames.
+    topic: /camera/camera2/color/image_raw/compressed
+  camera3:                  # right, serial 215122250915
+    topic: /camera/camera3/color/image_raw/compressed
