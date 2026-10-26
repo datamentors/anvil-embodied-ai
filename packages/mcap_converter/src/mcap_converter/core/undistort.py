@@ -1,5 +1,5 @@
 """
-Lens undistortion of camera frames (mcap-convert --undistort).
+Lens undistortion of camera frames (mcap-convert, on by default; --no-undistort skips it).
 
 Reads the session's intrinsic calibration from <session>/meta/camera_calibration.json
 (pinhole K + plumb_bob D per raw camera, e.g. cam_chest, at native resolution),
@@ -44,7 +44,10 @@ def build_undistortion(input_dir: str, camera_topic_mapping: Dict[str, str]) -> 
     """
     path = Path(input_dir) / SESSION_CALIBRATION
     if not path.is_file():
-        raise FileNotFoundError(f"--undistort needs {path}, which does not exist")
+        raise FileNotFoundError(
+            f"{path} does not exist: undistortion needs the session's camera calibration. "
+            "Pass --no-undistort to convert without undistorting."
+        )
     with open(path) as f:
         calibration = json.load(f)
 

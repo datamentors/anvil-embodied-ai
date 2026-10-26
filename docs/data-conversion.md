@@ -156,7 +156,7 @@ uv run mcap-convert \
 | `--vcodec` | `h264` | `h264` · `hevc` · `libsvtav1` |
 | `--robot-type` | `anvil_openarm` | `anvil_openarm` · `anvil_yam` |
 | `--act-from-obs-n-step N` | config value | Override `action_from_observation_n` at runtime: `action[t] = observation[t+N]` |
-| `--undistort` | — | Undistort camera frames with the session's `meta/camera_calibration.json` before resizing (see below) |
+| `--undistort` / `--no-undistort` | on | Undistort camera frames with the session's `meta/camera_calibration.json` before resizing (see below). `--no-undistort` keeps the frames as recorded |
 | `--quality-report PATH` | auto-discovered | Path to a mcap-valid JSON report — mcap-convert requires one to exist; if omitted, the default `<input-dir>/mcap_valid_reports/report.json` is used |
 | `--include-flagged [pass\|warning\|critical]` | `warning` | Highest severity tier to include when converting (inclusive threshold). `warning` (default) converts `pass` and `warning` episodes, skipping only `critical` ones automatically. `pass` is stricter — it also skips `warning` episodes. `critical` is the "convert everything" escape hatch — nothing is skipped. Works against whichever report the mandatory gate resolved (explicit or auto-discovered) |
 | `--skip-episode-idx SPEC` | — | Manually skip episodes by 1-based index (see below) |
@@ -189,9 +189,9 @@ uv run mcap-convert -i data/raw/my-session --config ... --skip-episode-idx "1,5:
 
 `--skip-episode-idx` doesn't need the quality report's *contents* to be relevant — but `mcap-convert` still needs *a* report to exist at all (per the mandatory gate above) before it will run, even if you're only using `--skip-episode-idx`.
 
-### Lens undistortion (`--undistort`)
+### Lens undistortion (on by default)
 
-With `--undistort`, each camera frame is undistorted at its native resolution, then resized as usual. The intrinsics come from `<input-dir>/meta/camera_calibration.json`, keyed by raw camera name (the first segment of the image topic, e.g. `/cam_chest/image_raw/compressed` → `cam_chest`):
+By default, each camera frame is undistorted at its native resolution, then resized as usual. The intrinsics come from `<input-dir>/meta/camera_calibration.json`, keyed by raw camera name (the first segment of the image topic, e.g. `/cam_chest/image_raw/compressed` → `cam_chest`):
 
 ```json
 {
@@ -204,7 +204,7 @@ With `--undistort`, each camera frame is undistorted at its native resolution, t
 }
 ```
 
-`dist_coeffs` are OpenCV plumb_bob `[k1, k2, p1, p2, k3]`. The conversion stops if the file is missing, if a configured camera has no entry, or if a frame is not at the calibrated resolution.
+`dist_coeffs` are OpenCV plumb_bob `[k1, k2, p1, p2, k3]`. The conversion stops if the file is missing, if a configured camera has no entry, or if a frame is not at the calibrated resolution. To convert a session without a calibration, pass `--no-undistort` explicitly.
 
 The undistorted camera matrix is computed once per camera with `cv2.getOptimalNewCameraMatrix(K, D, size, alpha=0)`, which keeps only valid pixels: no black borders, at the cost of the outermost field of view. The dataset gets its own `meta/camera_calibration.json`, keyed by dataset feature:
 
@@ -224,7 +224,7 @@ The undistorted camera matrix is computed once per camera with `cv2.getOptimalNe
 }
 ```
 
-`camera_matrix` is at the native resolution (`width` × `height`), not at the stored frame size (`output_width` × `output_height`); scale it by the resize factor to project into the stored frames. `dist_coeffs` are zero because the frames are already undistorted. The source calibration stays in the raw session. Without `--undistort`, frames and output are unchanged.
+`camera_matrix` is at the native resolution (`width` × `height`), not at the stored frame size (`output_width` × `output_height`); scale it by the resize factor to project into the stored frames. `dist_coeffs` are zero because the frames are already undistorted. The source calibration stays in the raw session. With `--no-undistort`, frames are stored as recorded and no `meta/camera_calibration.json` is written.
 
 ---
 

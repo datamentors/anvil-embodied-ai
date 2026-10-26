@@ -572,7 +572,7 @@ def _convert_shard_worker(
     progress_update_every: int,
     gpu_id: int | None = None,
     extra_episode_keys: tuple = (),
-    undistort: bool = False,
+    undistort: bool = True,
 ) -> dict:
     """Worker process entrypoint for one shard of episodes.
 
@@ -656,7 +656,7 @@ def convert_session(
     use_live_progress: bool = True,
     parallel_episode_workers: int = 1,
     extra_episode_keys: tuple = (),
-    undistort: bool = False,
+    undistort: bool = True,
 ):
     """
     Convert MCAP session to LeRobot dataset
@@ -681,6 +681,7 @@ def convert_session(
         parallel_episode_workers: Number of episode shards to run in parallel (0 = auto)
         undistort: Undistort frames with <input_dir>/meta/camera_calibration.json before
             resizing, and write the matching meta/camera_calibration.json to the dataset
+            (default). False keeps the frames as recorded
     """
     session_start_time = time.time()
 
@@ -1343,11 +1344,13 @@ def build_parser(profile: str = "standard") -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--undistort", action="store_true",
+        "--undistort", action=argparse.BooleanOptionalAction, default=True,
         help=(
             "undistort camera frames with <input-dir>/meta/camera_calibration.json "
             "(alpha=0: no black borders) before resizing, and write the matching "
-            "camera matrix to <output>/meta/camera_calibration.json"
+            "camera matrix to <output>/meta/camera_calibration.json (default: on). "
+            "--no-undistort keeps the frames as recorded, e.g. for sessions without "
+            "a calibration"
         ),
     )
     parser.add_argument(

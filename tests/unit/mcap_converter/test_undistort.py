@@ -1,9 +1,10 @@
-"""Tests for mcap-convert --undistort: lens undistortion with the session's calibration.
+"""Tests for mcap-convert lens undistortion with the session's calibration (on by default).
 
 Frames are undistorted at native resolution with the intrinsics in
 ``<session>/meta/camera_calibration.json`` (alpha=0: no black borders), then
 resized. The dataset gets a ``meta/camera_calibration.json`` with the
-undistorted camera matrix and zero distortion. Without the flag nothing changes.
+undistorted camera matrix and zero distortion. It is on by default;
+``--no-undistort`` keeps the frames as recorded.
 """
 
 import json
@@ -107,11 +108,27 @@ def test_write_output_calibration_stores_undistorted_matrix(namespace, tmp_path)
 
 
 @pytest.mark.parametrize("namespace", IMPLEMENTATIONS)
-def test_undistort_is_off_by_default(namespace):
+def test_undistort_is_on_by_default(namespace):
     convert = import_module(f"{namespace}.cli.convert")
 
-    assert convert.build_parser().parse_args(["-i", "session"]).undistort is False
-    assert convert.build_parser().parse_args(["-i", "session", "--undistort"]).undistort is True
+    assert convert.build_parser().parse_args(["-i", "session"]).undistort is True
+    assert convert.build_parser().parse_args(["-i", "session", "--no-undistort"]).undistort is False
+
+
+@pytest.mark.parametrize("namespace", IMPLEMENTATIONS)
+def test_convert_session_requires_calibration_by_default(namespace, tmp_path):
+    convert = import_module(f"{namespace}.cli.convert")
+    config = import_module(f"{namespace}.config.loader").ConfigLoader.from_yaml(CMD_CONFIG_PATH)
+
+    # The smoke fixture session has no meta/camera_calibration.json.
+    with pytest.raises(FileNotFoundError, match="--no-undistort"):
+        convert.convert_session(
+            input_dir=str(FIXTURES / "test-session"),
+            output_dir=str(tmp_path / "out"),
+            repo_id="local/no-calibration",
+            config=config,
+            debug_plot_episodes=0,
+        )
 
 
 @pytest.mark.parametrize("namespace", IMPLEMENTATIONS)

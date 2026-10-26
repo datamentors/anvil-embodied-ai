@@ -135,6 +135,7 @@ class TestQualitySkipMiddleEpisode:
                 mcap_files=mcap_files,
                 quality_skip_paths=quality_skip_paths,
                 debug_plot_episodes=0,
+                undistort=False,  # fixture session has no camera calibration
             )
 
         import tempfile
@@ -353,6 +354,7 @@ action_feature_mapping:
             "--quality-report", str(report_path),
             "--max-episodes", "3",
             "--debug-plot-episodes", "0",
+            "--no-undistort",  # fixture session has no camera calibration
         ]
 
     def test_no_include_flagged_arg_skips_critical_episode_by_default(self, tmp_path, capsys):
