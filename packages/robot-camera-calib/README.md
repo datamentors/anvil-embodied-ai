@@ -7,6 +7,7 @@ described by a YAML file in [`robots/`](robots/). Supported today:
 |---|---|---|---|
 | AgiBot G2 (head, hand_left, hand_right) | [`robots/g2.yaml`](robots/g2.yaml) | AgiBot GDK | AgiBot `intrinsic_*.json` |
 | Anvil workcell (cam_chest, cam_wrist_l, cam_wrist_r) | [`robots/anvil.yaml`](robots/anvil.yaml) | ROS 2 via rosbridge | ROS `camera_info` YAML |
+| RealMan RMC-AIDAL-III (camera1, camera2, camera3) | [`robots/realman.yaml`](robots/realman.yaml) | ROS 2 via rosbridge | ROS `camera_info` YAML |
 
 Adding another robot is a YAML file: see
 [`robot_camera_calib/README.md`](robot_camera_calib/README.md).
