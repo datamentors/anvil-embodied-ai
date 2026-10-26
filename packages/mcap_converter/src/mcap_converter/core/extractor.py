@@ -9,6 +9,7 @@ from ..config.schema import DEFAULT_DATA_CONFIG, DataConfig, JointNamePattern
 from ..exceptions import DataExtractionError
 from ..utils.image_utils import decode_compressed_image, decode_image
 from .reader import McapReader
+from .undistort import undistort_image
 
 # =============================================================================
 # Shared Utilities
@@ -562,6 +563,7 @@ class BufferedStreamExtractor:
         quiet: bool = False,
         progress_callback: Optional[Callable[[int], None]] = None,
         progress_every: int = 1,
+        undistort_maps: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None,
     ):
         """
         Initialize buffered stream extractor.
@@ -573,6 +575,8 @@ class BufferedStreamExtractor:
             quiet: If True, suppress all print output (default: False)
             progress_callback: Called with frames_yielded count after each frame
             progress_every: Emit callback/console progress every N yielded frames
+            undistort_maps: Per-camera cv2.remap tables (see core.undistort); when
+                set, frames are undistorted at native resolution before resizing
         """
         self.config = config
         self.fps = fps
@@ -584,6 +588,7 @@ class BufferedStreamExtractor:
         self.quiet = quiet
         self.progress_callback = progress_callback
         self.progress_every = max(1, progress_every)
+        self.undistort_maps = undistort_maps
         self._last_reported_frames = -1
 
         if self.config.action_from_observation:
@@ -881,6 +886,12 @@ class BufferedStreamExtractor:
                         "  -> No action data parsed from joint_states (no leader prefix matched)."
                     )
 
+    def _prepare_image(self, cam_name: str, img: np.ndarray, resize_func) -> np.ndarray:
+        """Undistort the native frame (when undistort_maps is set), then resize it."""
+        if self.undistort_maps is not None:
+            img = undistort_image(img, self.undistort_maps[cam_name])
+        return resize_func(img, self.target_size)
+
     def _align_frame_at_cursor(
         self,
         camera_buffers: Dict[str, deque],
@@ -908,7 +919,7 @@ class BufferedStreamExtractor:
         main_ts, main_img = camera_buffers[main_cam][cursor]
 
         # Resize main camera image
-        resized_main = resize_func(main_img, self.target_size)
+        resized_main = self._prepare_image(main_cam, main_img, resize_func)
         frame = {f"observation.images.{main_cam}": resized_main}
 
         # Find nearest match for each other camera
@@ -924,7 +935,7 @@ class BufferedStreamExtractor:
             nearest_idx = self._find_nearest_in_buffer(buffer, main_ts)
             if nearest_idx is not None:
                 _, img = buffer[nearest_idx]
-                resized_img = resize_func(img, self.target_size)
+                resized_img = self._prepare_image(cam_name, img, resize_func)
                 frame[f"observation.images.{cam_name}"] = resized_img
             else:
                 return None

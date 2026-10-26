@@ -46,6 +46,7 @@ class TestResumeDoesNotFragmentVideo:
             config=config,
             mcap_files=mcap_files,
             debug_plot_episodes=0,
+            undistort=False,  # fixture session has no camera calibration
         )
         single_pass_counts = _count_video_files(single_pass_dir)
 
@@ -63,6 +64,7 @@ class TestResumeDoesNotFragmentVideo:
             config=config,
             mcap_files=mcap_files[:half],
             debug_plot_episodes=0,
+            undistort=False,  # fixture session has no camera calibration
         )
         convert_session(
             input_dir=str(_FIXTURE_DIR),
@@ -76,6 +78,7 @@ class TestResumeDoesNotFragmentVideo:
             mcap_files=mcap_files,
             resume_from=half,
             debug_plot_episodes=0,
+            undistort=False,  # fixture session has no camera calibration
         )
         resumed_counts = _count_video_files(resumed_dir)
 

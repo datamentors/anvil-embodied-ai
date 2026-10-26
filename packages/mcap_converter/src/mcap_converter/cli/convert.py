@@ -52,6 +52,11 @@ from mcap_converter.core.episode_labels import (
 from mcap_converter.core.extractor import BufferedStreamExtractor
 from mcap_converter.core.quality import SEVERITY_CRITICAL, SEVERITY_PASS, SEVERITY_WARNING
 from mcap_converter.core.reader import snap_fps
+from mcap_converter.core.undistort import (
+    SESSION_CALIBRATION,
+    build_undistortion,
+    write_output_calibration,
+)
 from mcap_converter.utils.image_utils import (
     aspect_ratio_matches,
     decode_compressed_image,
@@ -567,6 +572,7 @@ def _convert_shard_worker(
     progress_update_every: int,
     gpu_id: int | None = None,
     extra_episode_keys: tuple = (),
+    undistort: bool = True,
 ) -> dict:
     """Worker process entrypoint for one shard of episodes.
 
@@ -611,6 +617,7 @@ def _convert_shard_worker(
             use_live_progress=False,
             parallel_episode_workers=1,
             extra_episode_keys=extra_episode_keys,
+            undistort=undistort,
         )
 
     return {
@@ -649,6 +656,7 @@ def convert_session(
     use_live_progress: bool = True,
     parallel_episode_workers: int = 1,
     extra_episode_keys: tuple = (),
+    undistort: bool = True,
 ):
     """
     Convert MCAP session to LeRobot dataset
@@ -671,6 +679,9 @@ def convert_session(
         progress_update_every: Throttle progress callback updates to every N frames
         use_live_progress: Enable Rich live progress rendering
         parallel_episode_workers: Number of episode shards to run in parallel (0 = auto)
+        undistort: Undistort frames with <input_dir>/meta/camera_calibration.json before
+            resizing, and write the matching meta/camera_calibration.json to the dataset
+            (default). False keeps the frames as recorded
     """
     session_start_time = time.time()
 
@@ -696,6 +707,10 @@ def convert_session(
     log(f"Buffered streaming (buffer={buffer_seconds}s)")
 
     config = resolve_image_resolution(config, mcap_files)
+
+    undistortion = build_undistortion(input_dir, config.camera_topic_mapping) if undistort else None
+    if undistortion:
+        log(f"Undistorting frames with [dim]{Path(input_dir) / SESSION_CALIBRATION}[/dim]")
 
     effective_parallel_workers = resolve_parallel_episode_workers(
         parallel_episode_workers,
@@ -778,6 +793,7 @@ def convert_session(
                             progress_update_every=progress_update_every,
                             gpu_id=shard_gpu_id,
                             extra_episode_keys=extra_episode_keys,
+                            undistort=undistort,
                         )
                         future_map[future] = (shard_index, len(shard_files))
 
@@ -800,6 +816,8 @@ def convert_session(
                     output_dir=output_dir,
                     repo_id=repo_id,
                 )
+                if undistortion:
+                    write_output_calibration(output_dir, undistortion, config.image_resolution)
                 _ensure_output_readable(output_dir)
 
                 if dataset.meta.total_frames > 0 and debug_plot_episodes > 0:
@@ -1023,6 +1041,7 @@ def convert_session(
                 quiet=True,
                 progress_callback=on_frame_progress if use_live_progress else None,
                 progress_every=max(1, progress_update_every),
+                undistort_maps={cam: c["maps"] for cam, c in undistortion.items()} if undistortion else None,
             )
 
             corrupt_frame_error: Exception | None = None
@@ -1154,6 +1173,8 @@ def convert_session(
     with console.status("[bold]Finalizing dataset (metadata & cleanup)..."):
         with suppress_fd_output():
             writer.finalize(dataset)
+        if undistortion:
+            write_output_calibration(output_dir, undistortion, config.image_resolution)
         # lerobot's video encoder writes .mp4 files as 0600 (bypassing umask),
         # which blocks any reader running as a different UID. Fix up
         # permissions across the whole output tree.
@@ -1320,6 +1341,15 @@ def build_parser(profile: str = "standard") -> argparse.ArgumentParser:
         help=(
             "number of episode shards to convert in parallel "
             "(0 = auto, 1 = off, default: profile-specific)"
+        ),
+    )
+    parser.add_argument(
+        "--no-calib", action="store_true",
+        help=(
+            "do not undistort camera frames. By default they are undistorted with "
+            "<input-dir>/meta/camera_calibration.json (alpha=0: no black borders) "
+            "before resizing, and the matching camera matrix is written to "
+            "<output>/meta/camera_calibration.json"
         ),
     )
     parser.add_argument(
@@ -1559,6 +1589,7 @@ def main_with_profile(args=None, profile: str = "standard"):
             extra_episode_keys=tuple(
                 k.strip() for k in args.extra_episode_keys.split(",") if k.strip()
             ),
+            undistort=not args.no_calib,
         )
 
         # Upload to Hub if requested

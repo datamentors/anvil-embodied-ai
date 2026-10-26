@@ -37,6 +37,7 @@ def _convert(output_dir: Path):
         task="manipulation",
         config=config,
         config_path=str(CONVERT_CONFIG),
+        undistort=False,  # fixture session has no camera calibration
     )
 
 

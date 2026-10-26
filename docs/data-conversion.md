@@ -156,6 +156,7 @@ uv run mcap-convert \
 | `--vcodec` | `h264` | `h264` · `hevc` · `libsvtav1` |
 | `--robot-type` | `anvil_openarm` | `anvil_openarm` · `anvil_yam` |
 | `--act-from-obs-n-step N` | config value | Override `action_from_observation_n` at runtime: `action[t] = observation[t+N]` |
+| `--no-calib` | off | Undistort camera frames with the session's `meta/camera_calibration.json` before resizing (see below). `--no-calib` keeps the frames as recorded |
 | `--quality-report PATH` | auto-discovered | Path to a mcap-valid JSON report — mcap-convert requires one to exist; if omitted, the default `<input-dir>/mcap_valid_reports/report.json` is used |
 | `--include-flagged [pass\|warning\|critical]` | `warning` | Highest severity tier to include when converting (inclusive threshold). `warning` (default) converts `pass` and `warning` episodes, skipping only `critical` ones automatically. `pass` is stricter — it also skips `warning` episodes. `critical` is the "convert everything" escape hatch — nothing is skipped. Works against whichever report the mandatory gate resolved (explicit or auto-discovered) |
 | `--skip-episode-idx SPEC` | — | Manually skip episodes by 1-based index (see below) |
@@ -187,6 +188,43 @@ uv run mcap-convert -i data/raw/my-session --config ... --skip-episode-idx "1,5:
 `--skip-episode-idx` ranges follow Python slice convention — the end index is **not included** (`1:4` → episodes 1, 2, 3; matches `range(1, 4)`, not "1 through 4 inclusive"). An omitted start defaults to `1`; an omitted end reaches the last episode (`3:` → episode 3 through the end).
 
 `--skip-episode-idx` doesn't need the quality report's *contents* to be relevant — but `mcap-convert` still needs *a* report to exist at all (per the mandatory gate above) before it will run, even if you're only using `--skip-episode-idx`.
+
+### Lens undistortion (on by default)
+
+By default, each camera frame is undistorted at its native resolution, then resized as usual. The intrinsics come from `<input-dir>/meta/camera_calibration.json`, keyed by raw camera name (the first segment of the image topic, e.g. `/cam_chest/image_raw/compressed` → `cam_chest`):
+
+```json
+{
+  "cam_chest": {
+    "camera_matrix": [[537.66, 0.0, 943.83], [0.0, 538.20, 574.32], [0.0, 0.0, 1.0]],
+    "dist_coeffs": [0.01296, -0.01833, -0.00171, -0.00102, 0.00237],
+    "width": 1920,
+    "height": 1080
+  }
+}
+```
+
+`dist_coeffs` are OpenCV plumb_bob `[k1, k2, p1, p2, k3]`. The conversion stops if the file is missing, if a configured camera has no entry, or if a frame is not at the calibrated resolution. To convert a session without a calibration, pass `--no-calib` explicitly.
+
+The undistorted camera matrix is computed once per camera with `cv2.getOptimalNewCameraMatrix(K, D, size, alpha=0)`, which keeps only valid pixels: no black borders, at the cost of the outermost field of view. The dataset gets its own `meta/camera_calibration.json`, keyed by dataset feature:
+
+```json
+{
+  "observation.images.base": {
+    "source": "cam_chest",
+    "undistorted": true,
+    "alpha": 0.0,
+    "camera_matrix": [[492.02, 0.0, 933.08], [0.0, 536.59, 572.68], [0.0, 0.0, 1.0]],
+    "dist_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+    "width": 1920,
+    "height": 1080,
+    "output_width": 640,
+    "output_height": 360
+  }
+}
+```
+
+`camera_matrix` is at the native resolution (`width` × `height`), not at the stored frame size (`output_width` × `output_height`); scale it by the resize factor to project into the stored frames. `dist_coeffs` are zero because the frames are already undistorted. The source calibration stays in the raw session. With `--no-calib`, frames are stored as recorded and no `meta/camera_calibration.json` is written.
 
 ---
 
