@@ -327,7 +327,7 @@ def run_section_b() -> None:
             "-i", str(session_copy),
             "--config", str(CONFIG),
             "--robot-type", "anvil_openarm",
-            "--no-undistort",  # fixture session has no camera calibration
+            "--no-calib",  # fixture session has no camera calibration
         ]
 
         # B2 — --include-flagged warning (the default): critical only skipped

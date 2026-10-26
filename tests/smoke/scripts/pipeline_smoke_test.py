@@ -230,7 +230,7 @@ def run_step_convert(sc: Scenario, force: bool) -> StepResult:
         "--config", str(sc.convert_config),
         "--robot-type", "anvil_openarm",
         "--quality-report", str(report_path),
-        "--no-undistort",  # fixture sessions have no camera calibration
+        "--no-calib",  # fixture sessions have no camera calibration
     ])
     dt = time.monotonic() - t0
 

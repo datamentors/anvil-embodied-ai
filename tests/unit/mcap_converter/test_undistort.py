@@ -4,7 +4,7 @@ Frames are undistorted at native resolution with the intrinsics in
 ``<session>/meta/camera_calibration.json`` (alpha=0: no black borders), then
 resized. The dataset gets a ``meta/camera_calibration.json`` with the
 undistorted camera matrix and zero distortion. It is on by default;
-``--no-undistort`` keeps the frames as recorded.
+``--no-calib`` keeps the frames as recorded.
 """
 
 import json
@@ -111,8 +111,8 @@ def test_write_output_calibration_stores_undistorted_matrix(namespace, tmp_path)
 def test_undistort_is_on_by_default(namespace):
     convert = import_module(f"{namespace}.cli.convert")
 
-    assert convert.build_parser().parse_args(["-i", "session"]).undistort is True
-    assert convert.build_parser().parse_args(["-i", "session", "--no-undistort"]).undistort is False
+    assert convert.build_parser().parse_args(["-i", "session"]).no_calib is False
+    assert convert.build_parser().parse_args(["-i", "session", "--no-calib"]).no_calib is True
 
 
 @pytest.mark.parametrize("namespace", IMPLEMENTATIONS)
@@ -121,7 +121,7 @@ def test_convert_session_requires_calibration_by_default(namespace, tmp_path):
     config = import_module(f"{namespace}.config.loader").ConfigLoader.from_yaml(CMD_CONFIG_PATH)
 
     # The smoke fixture session has no meta/camera_calibration.json.
-    with pytest.raises(FileNotFoundError, match="--no-undistort"):
+    with pytest.raises(FileNotFoundError, match="--no-calib"):
         convert.convert_session(
             input_dir=str(FIXTURES / "test-session"),
             output_dir=str(tmp_path / "out"),

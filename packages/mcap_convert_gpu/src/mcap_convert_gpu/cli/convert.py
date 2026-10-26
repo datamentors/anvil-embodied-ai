@@ -1414,13 +1414,12 @@ def build_parser(profile: str = "standard") -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--undistort", action=argparse.BooleanOptionalAction, default=True,
+        "--no-calib", action="store_true",
         help=(
-            "undistort camera frames with <input-dir>/meta/camera_calibration.json "
-            "(alpha=0: no black borders) before resizing, and write the matching "
-            "camera matrix to <output>/meta/camera_calibration.json (default: on). "
-            "--no-undistort keeps the frames as recorded, e.g. for sessions without "
-            "a calibration"
+            "do not undistort camera frames. By default they are undistorted with "
+            "<input-dir>/meta/camera_calibration.json (alpha=0: no black borders) "
+            "before resizing, and the matching camera matrix is written to "
+            "<output>/meta/camera_calibration.json"
         ),
     )
     parser.add_argument(
@@ -1688,7 +1687,7 @@ def main_with_profile(args=None, profile: str = "standard"):
             extra_episode_keys=tuple(
                 k.strip() for k in args.extra_episode_keys.split(",") if k.strip()
             ),
-            undistort=args.undistort,
+            undistort=not args.no_calib,
         )
 
         # Upload to Hub if requested
