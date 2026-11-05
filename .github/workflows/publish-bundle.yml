@@ -1,0 +1,121 @@
+name: Publish processing bundles
+
+# Builds the bundles a LOOP processing contract pins (anvil-shared and mcap-converter
+# wheels, the configs tarball) and uploads them with their SHA256SUMS to
+# s3://$LOOP_ARTIFACTS_BUCKET/processing/bundles/<name>/<version>/.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: publish-bundle-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BUCKET: ${{ vars.LOOP_ARTIFACTS_BUCKET }}
+      ROLE_ARN: ${{ vars.LOOP_ARTIFACTS_ROLE_ARN }}
+    steps:
+      - name: Check repository variables
+        run: |
+          if [ -z "$BUCKET" ] || [ -z "$ROLE_ARN" ]; then
+            echo "::error::Set the repository variables LOOP_ARTIFACTS_BUCKET and LOOP_ARTIFACTS_ROLE_ARN"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build bundles
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA::7}"
+          # Commit time as every file timestamp, so a rebuild of the same commit gives the same bytes.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+
+          # Local version +g<short sha>, set in this checkout only.
+          python3 - "$short" <<'EOF'
+          import re
+          import sys
+          from pathlib import Path
+
+          for pyproject in (Path("packages/anvil_shared/pyproject.toml"), Path("packages/mcap_converter/pyproject.toml")):
+              text, count = re.subn(
+                  r'(?m)^version = "([^"+]+)"$', rf'version = "\g<1>+g{sys.argv[1]}"', pyproject.read_text(), count=1
+              )
+              if count != 1:
+                  sys.exit(f"no plain [project] version in {pyproject}")
+              pyproject.write_text(text)
+          EOF
+
+          for bundle in anvil-shared:packages/anvil_shared mcap-converter:packages/mcap_converter; do
+            name="${bundle%%:*}"
+            src="${bundle#*:}"
+            version="$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$src/pyproject.toml")"
+            uv build --wheel --out-dir "dist/$name/$version" "$src"
+          done
+
+          # The tarball root is the content of configs/, so {bundle:anvil-configs}/mcap_converter/<config>.yaml resolves.
+          mkdir -p "dist/anvil-configs/g$short"
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$SOURCE_DATE_EPOCH" -C configs -cf - . \
+            | gzip -n > "dist/anvil-configs/g$short/anvil-configs.tar.gz"
+
+          for dir in dist/*/*/; do
+            (cd "$dir" && sha256sum -- * > SHA256SUMS)
+          done
+          ls -lR dist
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.LOOP_ARTIFACTS_ROLE_ARN }}
+          role-session-name: publish-bundle-${{ github.run_id }}
+          aws-region: ${{ vars.LOOP_ARTIFACTS_REGION || 'eu-west-1' }}
+
+      - name: Upload bundles
+        run: |
+          set -euo pipefail
+          {
+            echo "## Processing bundles for \`${GITHUB_SHA::7}\`"
+            echo
+            echo "Bucket \`$BUCKET\`"
+            echo
+            echo "| name | kind | key | sha256 |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          snippet=""
+          for dir in dist/*/*/; do
+            name="$(basename "$(dirname "$dir")")"
+            prefix="processing/bundles/$name/$(basename "$dir")"
+            for file in "$dir"*; do
+              aws s3 cp --only-show-errors "$file" "s3://$BUCKET/$prefix/$(basename "$file")"
+            done
+            while read -r sum file; do
+              kind=wheel
+              [[ "$file" == *.tar.gz ]] && kind=tarball
+              echo "$prefix/$file $sum"
+              echo "| $name | $kind | \`$prefix/$file\` | \`$sum\` |" >> "$GITHUB_STEP_SUMMARY"
+              snippet+="  - { name: $name, kind: $kind, key: $prefix/$file, sha256: $sum }"$'\n'
+            done < "${dir}SHA256SUMS"
+          done
+          {
+            echo
+            echo "Contract \`bundles:\` entries:"
+            echo
+            echo '```yaml'
+            echo "bundles:"
+            printf '%s' "$snippet"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
