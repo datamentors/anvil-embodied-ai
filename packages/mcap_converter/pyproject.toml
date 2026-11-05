@@ -57,6 +57,8 @@ stratified-split = "mcap_converter.cli.stratified_split:main"
 label-session = "mcap_converter.cli.label_session:main"
 annotate-dataset = "mcap_converter.cli.annotate_dataset:main"
 mcap-valid = "mcap_converter.cli.mcap_valid:main"
+mcap-exclude = "mcap_converter.cli.mcap_exclude:main"
+session-valid = "mcap_converter.cli.session_valid:main"
 
 [project.urls]
 Homepage = "https://github.com/anvil-robotics/anvil-embodied-ai"
