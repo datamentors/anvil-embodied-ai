@@ -6,7 +6,7 @@ Convert a **recorded session** into a LeRobot v3.0 dataset.
 
 A session is a directory of raw MCAP files (e.g. `data/raw/my-session/`) — one `.mcap` file per episode, all from the same recording run. Every tool below targets that same session directory, from the initial quality scan through to the finished dataset.
 
-**The usual flow:** `mcap-valid` (scan the target session for problems) → `mcap-convert` (convert that session into a dataset) → `dataset-valid` (sanity-check the result). The other tools below (`mcap-to-video`, `merge-datasets`, `hf-upload`) are used as needed, not part of every conversion.
+**The usual flow:** `mcap-valid` (scan the target session for problems) → `mcap-exclude` (move out episodes that must not be converted, then re-run `mcap-valid`) → `mcap-convert` (convert that session into a dataset) → `dataset-valid` (sanity-check the result) → `session-valid` (check the dataset against the raw session). `mcap-exclude` and `session-valid` are what the LOOP processing contract runs around every conversion; by hand they are optional. The other tools below (`mcap-to-video`, `merge-datasets`, `hf-upload`) are used as needed, not part of every conversion.
 
 ```
 ┌─────────────────┐
@@ -22,6 +22,13 @@ A session is a directory of raw MCAP files (e.g. `data/raw/my-session/`) — one
       │
       ▼
 ┌─────────────────┐
+│  mcap-exclude   │  move out episodes that must not be converted
+│                 │  - low fps, silent command arms, a manual list
+│                 │  - then re-run mcap-valid on what remains
+└─────────────────┘
+      │
+      ▼
+┌─────────────────┐
 │  mcap-convert   │  convert the whole session → one LeRobot v3.0 dataset
 │                 │  - required: refuses to run without the report above
 │                 │  - skips critical episodes by default (--include-flagged to override)
@@ -30,6 +37,12 @@ A session is a directory of raw MCAP files (e.g. `data/raw/my-session/`) — one
       ▼
 ┌─────────────────┐
 │  dataset-valid  │  sanity-check the converted dataset
+└─────────────────┘
+      │
+      ▼
+┌─────────────────┐
+│  session-valid  │  check the dataset against the raw session
+│                 │  - episode accounting, lengths, videos, labels
 └─────────────────┘
 
 Used as needed, not part of every conversion:
@@ -82,6 +95,49 @@ An episode's overall status is its single worst topic's severity. `--fail-on-cri
 | `--stream-min-gap N` | `0.5` | Absolute floor (seconds) below which a stream gap is never flagged |
 | `--action-warn-gap N` | `1.0` | Minimum idle duration (seconds) before an action-topic gap is reported |
 | `--fps-tolerance N` | `0.15` | Fraction below the batch's median fps before flagging degradation |
+
+---
+
+## mcap-exclude
+
+Move out of a session the episodes that must not be converted, before `mcap-convert` runs. It reads the session's `mcap-valid` report and the conversion config you are about to use, and moves each offending episode folder into `--excluded-dir`. It changes the session in place: run it on a copy when the raw recording must stay untouched.
+
+| Reason | When |
+|--------|------|
+| `low_fps` | The reference camera (first `camera_topic_mapping` entry, the one `mcap-convert` detects fps from) snaps below `--fps`. `mcap-convert` refuses an `--fps` above the slowest episode's, skipped episodes included, so one slow episode would otherwise abort the whole session |
+| `no_commands_<arm>` | The report shows zero messages on that arm's command topic (`action_topics`). `mcap-valid` rates this only `warning`, so `mcap-convert` would keep the episode and fill its actions with measured positions. `--no-commands all` only moves episodes where every arm is silent, keeping one-handed ones. Not applied to `action_from_observation` configs, which never read the commands |
+| `manual` | Listed in `--manual`: a TSV of `episode<TAB>reason` lines, `#` comments allowed |
+
+Critical episodes stay in place — `mcap-convert` skips them itself. Re-run `mcap-valid` afterwards so the report covers only the episodes that remain.
+
+```bash
+uv run mcap-exclude -i data/raw/my-session \
+  --report data/raw/my-session/mcap_valid_reports/report.json \
+  --config configs/mcap_converter/openarm_bimanual_quest.yaml --fps 30 \
+  --excluded-dir data/excluded/my-session --out data/excluded/my-session.json
+uv run mcap-exclude ... --no-commands all       # keep one-handed episodes
+uv run mcap-exclude ... --manual reviewed.tsv   # also move out reviewed episodes
+uv run mcap-valid -i data/raw/my-session        # refresh the report for what remains
+```
+
+`--out` records what was moved, for `session-valid`. `total` and `kept` count MCAP files (one per episode) before and after the move; `fps` is the episode's snapped reference-camera fps, and `manual_reason` is added for `manual` exclusions:
+
+```json
+{"excluded": [{"episode": "0007", "reasons": ["low_fps"], "fps": 24}], "kept": 41, "total": 42}
+```
+
+Exits 0 on success, also when every episode is excluded (`kept: 0`), and 2 on bad input: a missing report or config, an MCAP missing from the report (re-run `mcap-valid`), or an episode folder already present in `--excluded-dir`. Nothing is moved when it exits 2.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-i / --input PATH` | _(required)_ | The session directory, one folder per episode |
+| `--report PATH` | _(required)_ | The session's `mcap-valid` JSON report |
+| `--config PATH` | _(required)_ | The `mcap-convert` config: reference camera and command topics |
+| `--fps N` | _(required)_ | The output fps `mcap-convert` will run at |
+| `--excluded-dir PATH` | _(required)_ | Where excluded episode folders are moved; must be outside the session |
+| `--out PATH` | _(required)_ | Where the exclusions JSON is written |
+| `--no-commands [any\|all]` | `any` | Exclude when any arm's command topic is silent, or only when all are |
+| `--manual PATH` | — | TSV of episodes to exclude by hand (`episode<TAB>reason`) |
 
 ---
 
@@ -244,6 +300,57 @@ Expected: 5 checks all showing `[OK]`.
 | `--repo-id ID` | `anvil_robot/manipulation_v1` | Dataset repository ID passed to `LeRobotDataset` |
 
 To browse the converted dataset with a Rerun viewer, see [Dataset Visualization](dataset-viz.md).
+
+---
+
+## session-valid
+
+Check a converted dataset against the raw session it came from, before it is published or merged. Point `--raw` at the session `mcap-convert` read (after `mcap-exclude`), `--dataset` at what it wrote, and `--exclusions` at the `mcap-exclude` JSON. The `mcap-valid` report is read from `<raw>/mcap_valid_reports/report.json`.
+
+| Check | Result |
+|-------|--------|
+| `episode_accounting` | Fail unless raw MCAPs = dataset episodes + excluded + skipped by `mcap-convert` (above `--include-flagged` in the report). An episode `mcap-convert` dropped on its own (corrupt or empty frames) only warns, named through the `source_episode_dir` / `source_mcap` columns |
+| `info_json` | Fail when `meta/info.json` is missing, `codebase_version` is not `v3.0`, or fps is not a positive integer (or not `--fps`) |
+| `episode_lengths` | Fail when `meta/episodes` does not have one row per episode, an episode is empty, or the lengths do not add up to `total_frames` |
+| `data_rows` | Fail when the data parquet rows or episodes differ from `meta/info.json` |
+| `action_state` | Share of an episode's frames whose action equals the measured state, a sign of missing commands: warn above `--action-state-warn`, fail above `--action-state-fail` |
+| `frames_vs_duration` | Warn when an episode's length / (recorded duration × fps) is outside [`--frames-ratio-min`, `--frames-ratio-max`] |
+| `videos` | Fail unless the non-empty video features match `--expected-cameras`, or when a video feature has missing or empty MP4s |
+| `labels` | Label columns (`--labels`) missing or empty: warn, or fail with `--require-labels`. A label that differs from the episode's raw `metadata.json`: fail |
+| `provenance` | Fail when `conversion_config.yaml` is missing; warn when it records no `code_commit` / `code_tag` / `code_version` |
+
+```bash
+uv run session-valid --raw data/raw/my-session --dataset data/datasets/my-session \
+  --exclusions data/excluded/my-session.json --out data/datasets/my-session.valid.json
+uv run session-valid ... --require-labels --expected-cameras 2
+```
+
+The result goes to `--out`; the overall status is the worst check's:
+
+```json
+{"status": "warn",
+ "checks": [{"name": "episode_accounting", "status": "pass", "detail": "raw 42 = dataset 39 + excluded 2 + skipped 1"}, ...],
+ "episodes": {"raw": 42, "dataset": 39, "excluded": 2, "skipped": 1}}
+```
+
+Exits 0 for `pass` or `warn` and 1 for `fail`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--raw PATH` | _(required)_ | The raw session `mcap-convert` read |
+| `--dataset PATH` | _(required)_ | The dataset `mcap-convert` wrote |
+| `--exclusions PATH` | _(required)_ | The `mcap-exclude` JSON for this session |
+| `--out PATH` | _(required)_ | Where the result JSON is written |
+| `--expected-cameras N` | `3` | Non-empty video features the dataset must have |
+| `--require-labels` | — | Fail, not warn, when episode labels are missing or empty |
+| `--labels K1,K2` | the keys `mcap-convert` lifts | Label columns to check (default: `envelope_size`, `envelope_facing_side`, `destination_basket_side`, `arm`, whichever the raw or the dataset carries) |
+| `--report PATH` | `<raw>/mcap_valid_reports/report.json` | The `mcap-valid` JSON report |
+| `--include-flagged [pass\|warning\|critical]` | `warning` | The `--include-flagged` `mcap-convert` ran with, to know which episodes it skipped |
+| `--fps N` | — | The fps `meta/info.json` must declare |
+| `--action-state-warn F` | `0.2` | Share of action = state frames above which an episode warns |
+| `--action-state-fail F` | `0.5` | Share of action = state frames above which an episode fails |
+| `--frames-ratio-min F` | `0.9` | Lowest accepted length / (duration × fps) |
+| `--frames-ratio-max F` | `1.05` | Highest accepted length / (duration × fps) |
 
 ---
 
