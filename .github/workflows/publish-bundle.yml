@@ -4,10 +4,10 @@ name: Publish processing bundles
 # wheels, the configs tarball) and uploads them with their SHA256SUMS to
 # s3://$LOOP_ARTIFACTS_BUCKET/processing/bundles/<name>/<version>/.
 
-# Runs only when the code or configs a bundle carries change on main; workflow_dispatch republishes on demand.
+# Runs on any branch, only when the code or configs a bundle carries change; each bundle is named by its commit, so a branch's bundle is used only when a contract pins it. workflow_dispatch republishes on demand.
 on:
   push:
-    branches: [main]
+    branches: ["**"]
     paths:
       - packages/mcap_converter/**
       - packages/anvil_shared/**
