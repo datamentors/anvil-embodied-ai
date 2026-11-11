@@ -14,6 +14,7 @@ import math
 import multiprocessing as mp
 import threading
 import time
+import json
 from typing import Any
 
 import torch
@@ -217,19 +218,41 @@ class MultiProcessStrategy:
         self._stop_event = ctx.Event()
         self._worker_processes = []
 
+        # Optional lens calibration, same format as a raw session's
+        # meta/camera_calibration.json (keyed by raw camera name, e.g. cam_chest).
+        # Workers then undistort exactly like the converter did for training.
+        calibration_file = self._config.get("cameras", {}).get("calibration_file")
+        calibration = {}
+        if calibration_file:
+            with open(calibration_file) as f:
+                calibration = json.load(f)
+
+
         for topic, camera_name in self._camera_mapping.items():
+            source = topic.strip("/").split("/")[0]  # /cam_chest/image_raw/compressed -> cam_chest
+            if calibration and source not in calibration:
+                raise ValueError(
+                    f"{calibration_file} has no calibration for {source}; "
+                    f"it has: {', '.join(sorted(calibration))}"
+                )
+
             p = ctx.Process(
                 target=run_image_worker,
                 args=(topic, camera_name, self._image_shape),
                 kwargs={
                     "stop_event": self._stop_event,
                     "debug_dir": self._debug_image_dir,
+                    "calibration": calibration.get(source),
                 },
                 name=f"image_worker_{camera_name}",
             )
             p.start()
             self._worker_processes.append(p)
-            self._node.get_logger().info(f"Started worker: {topic} -> {camera_name} (PID: {p.pid})")
+            self._node.get_logger().info(
+                f"Started worker: {topic} -> {camera_name} (PID: {p.pid}, "
+                f"undistort={'on' if calibration.get(source) else 'off'})"
+            )
+
 
         if self._joint_state_worker_enabled:
             p = ctx.Process(

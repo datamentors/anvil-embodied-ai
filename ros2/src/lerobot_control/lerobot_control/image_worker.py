@@ -49,12 +49,21 @@ class ImageWorkerNode(Node):
         buffer_name_prefix: str = "lerobot_img_",
         debug_dir: str | None = None,
         debug_max_frames: int = 10,
+        calibration: dict | None = None,
     ):
         super().__init__(f"image_worker_{camera_name}")
 
         self.camera_name = camera_name
         self.camera_topic = camera_topic
         self.image_shape = image_shape
+
+        self._undistort_maps = None
+        if calibration is not None:
+            K = np.array(calibration["camera_matrix"], dtype=np.float64)
+            D = np.array(calibration["dist_coeffs"], dtype=np.float64)
+            size = (int(calibration["width"]), int(calibration["height"]))
+            K_new, _ = cv2.getOptimalNewCameraMatrix(K, D, size, 0.0, size)
+            self._undistort_maps = cv2.initUndistortRectifyMap(K, D, None, K_new, size, cv2.CV_16SC2)
 
         self._debug_dir = Path(debug_dir) / camera_name if debug_dir else None
         self._debug_max_frames = debug_max_frames
@@ -161,6 +170,15 @@ class ImageWorkerNode(Node):
                 self._reject_bad_frame(JpegDecodeResult(image=None))
                 return
 
+            if self._undistort_maps is not None:
+                map1, map2 = self._undistort_maps
+                if image.shape[:2] != map1.shape[:2]:
+                    raise RuntimeError(
+                        f"frame {image.shape[1]}x{image.shape[0]} does not match "
+                        f"calibration {map1.shape[1]}x{map1.shape[0]}"
+                    )
+                image = cv2.remap(image, map1, map2, cv2.INTER_LINEAR)
+
             # Convert BGR to RGB
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
@@ -225,6 +243,7 @@ def run_image_worker(
     stop_event=None,
     debug_dir: str | None = None,
     debug_max_frames: int = 10,
+    calibration: dict | None = None,
 ):
     """
     Entry point for running image worker in a separate process.
@@ -249,6 +268,7 @@ def run_image_worker(
         buffer_name_prefix=buffer_name_prefix,
         debug_dir=debug_dir,
         debug_max_frames=debug_max_frames,
+        calibration=calibration,
     )
     node.get_logger().info(f"OpenCV worker threads: {cv2.getNumThreads()}")
 

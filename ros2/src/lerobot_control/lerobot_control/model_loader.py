@@ -4,8 +4,12 @@ Simplified model loader that uses LeRobot's built-in PolicyProcessorPipeline
 for pre/post processing instead of custom implementations.
 """
 
+import base64
+import io
 import json
 import random
+import urllib.request
+from collections import deque
 from contextlib import suppress
 from hashlib import sha256
 from pathlib import Path
@@ -51,6 +55,72 @@ def reset_model_state(model):
     """
     if hasattr(model, "reset"):
         model.reset()
+
+
+class GAMClient:
+    """Grounded Action Model served by GAM's HTTP policy server.
+
+    GAM needs its own Python environment, so it runs as a separate process
+    (benchmarks/robotwin/server.py in the Grounded-Action-Model repo). This
+    client turns the LeRobot observation into GAM inputs and replays each
+    predicted chunk one action per control tick, like ACT's action queue.
+    """
+
+    def __init__(self, url: str, image_key: str = "observation.images.base"):
+        self.url = url.rstrip("/")
+        self.image_key = image_key
+        self._action_queue: deque = deque()
+        self.reset()
+
+    def _post(self, path: str, payload: dict) -> dict:
+        request = urllib.request.Request(
+            self.url + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=10.0) as response:
+            return json.loads(response.read())
+
+    @staticmethod
+    def _b64(array: np.ndarray) -> str:
+        buffer = io.BytesIO()
+        np.savez(buffer, a=array)
+        return base64.b64encode(buffer.getvalue()).decode()
+
+    def reset(self) -> None:
+        """New episode: GAM restarts the tracker; K, E and chunk length come from its training yaml."""
+        info = self._post("/reset", {})
+        data = info["data"]
+        self.K = np.asarray(data["camera_intrinsics"], dtype=np.float64)
+        E = np.asarray(data["camera_extrinsics"], dtype=np.float64)
+        if data.get("extrinsic_is_cam2base", False):  # 4x4 camera pose -> 3x4 base->camera
+            R, t = E[:3, :3], E[:3, 3]
+            E = np.hstack([R.T, (-R.T @ t)[:, None]])
+        self.E = E.reshape(3, 4)
+        self.exec_steps = int(info["eval"]["replan"]["exec_steps"])
+        self._action_queue.clear()
+
+    def select_action(self, observation: dict) -> np.ndarray:
+        image = observation[self.image_key][0]  # (3, H, W) float in [0, 1]
+        rgb = (image.permute(1, 2, 0) * 255.0).round().to(torch.uint8).cpu().numpy()
+        if self._action_queue:
+            self._post("/advance", {"rgb": self._b64(rgb)})
+            return self._action_queue.popleft()
+        state = observation["observation.state"].reshape(-1).cpu().numpy().astype(np.float32)
+        depth = np.zeros(rgb.shape[:2], dtype=np.float32)  # GAM predicts depth; no sensor in training
+        response = self._post(
+            "/act",
+            {
+                "rgb": self._b64(rgb),
+                "depth": self._b64(depth),
+                "K": self.K.tolist(),
+                "E": self.E.tolist(),
+                "state": state.tolist(),
+            },
+        )
+        chunk = np.asarray(response["actions"], dtype=np.float32)[: self.exec_steps]
+        self._action_queue.extend(chunk[1:])
+        return chunk[0]
 
 
 class ModelLoader:
@@ -377,6 +447,11 @@ class ModelLoader:
                         "Pi0.5 from_pretrained returned without completing strict "
                         "checkpoint weight loading; refusing random/partial weights"
                     )
+            elif self.model_type == "gam":
+                server_url = json.loads((self.model_path / "config.json").read_text())["server_url"]
+                self._model = GAMClient(server_url)
+                self._log("info", f"GAM policy served by {server_url}")
+                return self._model
             else:
                 raise ValueError(f"Unsupported model type: {self.model_type}")
 
@@ -498,6 +573,9 @@ class ModelLoader:
             Tuple of (model, preprocessor_pipeline, postprocessor_pipeline)
         """
         model = self.load()
+
+        if self.model_type == "gam":
+            return model, None, None
 
         pre_processor = None
         post_processor = None

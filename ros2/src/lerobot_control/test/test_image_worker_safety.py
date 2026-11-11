@@ -37,6 +37,7 @@ def _make_node() -> tuple[image_worker.ImageWorkerNode, Mock]:
     node = image_worker.ImageWorkerNode.__new__(image_worker.ImageWorkerNode)
     node.camera_name = "base"
     node.image_shape = (4, 4, 3)
+    node._undistort_maps = None
     node._debug_dir = None
     node._debug_max_frames = 0
     node._debug_saved = 0
